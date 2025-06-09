@@ -10,28 +10,72 @@ app.use(express.json());
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function calculateEstimate(data) {
-  const { distanceKm, days, staff, useVentilator, useECMO } = data;
-  const wages = {
-    doctor: 1000000,
-    nurse: 500000,
-    handler: 1000000,
-    staff: 400000,
-  };
+  const {
+    type, distanceKm = 0, days = 1, staff = [],
+    useVentilator, useECMO,
+    funeralType, personnel = 0, audienceSize = 0, eventScale = "소규모"
+  } = data;
 
   let laborCost = 0;
-  staff.forEach(role => {
-    laborCost += wages[role] * days;
-  });
+  let equipmentCost = 0;
+  let transportCost = 0;
+  let total = 0;
 
-  let equipmentCost = 4500000 * days;
-  if (useVentilator) equipmentCost += 5000000 * days;
-  if (useECMO) equipmentCost += 20000000 * days;
+  if (type === "항공이송") {
+    const wages = {
+      doctor: 1000000,
+      nurse: 500000,
+      handler: 1000000,
+      staff: 400000,
+    };
 
-  const flightCost = distanceKm * 150 * 6; // 민항기 스트레쳐 기준
-  const total = laborCost + equipmentCost + flightCost;
+    staff.forEach(role => {
+      laborCost += wages[role] * days;
+    });
+
+    equipmentCost = 4500000 * days;
+    if (useVentilator) equipmentCost += 5000000 * days;
+    if (useECMO) equipmentCost += 20000000 * days;
+
+    transportCost = distanceKm * 150 * 6;
+    total = laborCost + equipmentCost + transportCost;
+  }
+
+  else if (type === "행사의료지원") {
+    const wages = {
+      specialist: 650000,
+      general: 550000,
+      nurse: 250000,
+      assistant: 150000,
+      staff: 150000,
+    };
+
+    staff.forEach(role => {
+      laborCost += wages[role] * days;
+    });
+
+    equipmentCost = 300000 * days;
+    let drugCost = 200000;
+    if (audienceSize > 1000) drugCost = 650000;
+
+    total = laborCost + equipmentCost + drugCost;
+  }
+
+  else if (type === "고인이송") {
+    const transportUnit = 2900;
+    const documentFee = 2000000;
+    const embalmingCost = 15000000;
+    const funeralPeopleCost = funeralType === "관" ? personnel * 200000 : 0;
+    const cremationCost = funeralType === "화장" ? 3500000 : 0;
+    const flightCost = funeralType === "관" ? 6000000 : 1250000;
+
+    transportCost = distanceKm * transportUnit;
+    total = transportCost + documentFee + embalmingCost + funeralPeopleCost + cremationCost + flightCost;
+  }
 
   return {
-    항공료: flightCost,
+    유형: type,
+    항공료: transportCost,
     인건비: laborCost,
     장비비: equipmentCost,
     총합계: total
@@ -53,6 +97,8 @@ app.post("/chat", async (req, res) => {
   if (estimate) {
     aiContext += `\n\n[계산된 견적]\n- 항공료: ${estimate.항공료.toLocaleString()}원\n- 인건비: ${estimate.인건비.toLocaleString()}원\n- 장비비: ${estimate.장비비.toLocaleString()}원\n- 총합계: ${estimate.총합계.toLocaleString()}원`;
   }
+
+  aiContext += `\n\n항공이송은 환자상태(영상, 진단서, 의식유무)를 기반으로 판단하고, 고인 이송은 화장/관 여부에 따라 분기됩니다. 행사의료지원은 인원 수, 행사유형, 법적 요건에 따라 의사 필요 여부를 판단합니다.`;
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
