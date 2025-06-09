@@ -1,138 +1,83 @@
+/* 📄 backend/index.js */
 import express from "express";
 import cors from "cors";
+import { config } from "dotenv";
 import { OpenAI } from "openai";
 
+config();                                   // .env에 OPENAI_API_KEY 작성
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ✅ 견적 계산 로직
-function calculateCosts(type, data) {
-  let total = 0;
-  const result = {
-    category: type,
-    항공료: 0,
-    인건비: 0,
-    장비비: 0,
-    기타비용: 0,
-    총합계: 0
-  };
+/* ── 견적 계산 로직 ───────────────────────── */
+function calculateCosts(type, data = {}) {
+  const res = { category:type, 항공료:0, 인건비:0, 장비비:0, 기타비용:0, 총합계:0 };
 
   if (type === "항공이송") {
-    const { distanceKm = 0, days = 3, staff = [], useVentilator, useECMO } = data;
+    const { distanceKm=0, days=3, staff=[], useVentilator, useECMO } = data;
+    const wages = { doctor:1_000_000, nurse:500_000, handler:1_000_000, staff:400_000 };
+    staff.forEach(r => { if (wages[r]) res.인건비 += wages[r]*days; });
 
-    const wages = {
-      doctor: 1000000,
-      nurse: 500000,
-      handler: 1000000,
-      staff: 400000
-    };
-    staff.forEach(role => {
-      if (wages[role]) result.인건비 += wages[role] * days;
-    });
+    res.장비비 += 4_500_000*days;
+    if (useVentilator) res.장비비 += 5_000_000*days;
+    if (useECMO)       res.장비비 += 20_000_000*days;
 
-    result.장비비 += 4500000 * days;
-    if (useVentilator) result.장비비 += 5000000 * days;
-    if (useECMO) result.장비비 += 20000000 * days;
-
-    result.항공료 += distanceKm * 150 * 6;
-    result.기타비용 += 3000000 + 400000 * 2;
+    res.항공료 += distanceKm * 150 * 6;       // 스트레처 6석
+    res.기타비용 += 3_000_000 + 400_000*2;    // 구급차·숙박 등
   }
 
   else if (type === "행사의료지원") {
-    const { attendees = 100, hours = 8, includeDefib, includeAmbulance } = data;
-
-    result.인건비 = (hours > 8 ? 700000 : 400000) * 3;
-    result.장비비 = 300000;
-    if (includeDefib) result.장비비 += 200000;
-    if (includeAmbulance) result.기타비용 += 3000000;
+    const { hours=8, includeDefib, includeAmbulance } = data;
+    res.인건비 = (hours>8?700_000:400_000)*3;
+    res.장비비 = 300_000 + (includeDefib?200_000:0);
+    if (includeAmbulance) res.기타비용 += 3_000_000;
   }
 
   else if (type === "고인이송") {
-    const { cremation, distanceKm = 0, isInternational } = data;
-
-    result.항공료 = isInternational
-      ? (cremation ? 1500000 : 6000000)
-      : distanceKm * 2900;
-
-    result.기타비용 += cremation ? 3500000 : 15000000;
-    result.기타비용 += 2000000; // 핸들링
+    const { cremation, distanceKm=0, isInternational } = data;
+    res.항공료 = isInternational ? (cremation?1_500_000:6_000_000) : distanceKm*2_900;
+    res.기타비용 += (cremation?3_500_000:15_000_000) + 2_000_000; // 핸들링
   }
 
-  total = result.항공료 + result.인건비 + result.장비비 + result.기타비용;
-  result.총합계 = total;
-
-  return result;
+  res.총합계 = res.항공료 + res.인건비 + res.장비비 + res.기타비용;
+  return res;
 }
 
-// ✅ 상담 요청 처리
+/* ── /chat 엔드포인트 ─────────────────────── */
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.post("/chat", async (req, res) => {
-  const { message, contextType, patient, transportData } = req.body;
+  const { message="", contextType, patient, transportData } = req.body;
+  if (!contextType) return res.json({ reply:"contextType 누락" });
 
-  const sensitiveTrigger = /단가|계산식|어떻게 나온|근거|세부.*금액/i;
-  const fixedReply = "📌 해당 정보는 계약 체결 후 제공 가능한 내부 기준입니다. 양해 부탁드립니다.";
+  const estimate = calculateCosts(contextType, transportData);
+  const sensitive = /단가|계산식|어떻게 나온|근거|세부.*금액/i;
+  const blockMsg  = "📌 해당 정보는 계약 체결 후 제공 가능한 내부 기준입니다. 양해 부탁드립니다.";
 
-  const estimate = contextType ? calculateCosts(contextType, transportData || {}) : null;
-
-  let systemPrompt = `
-당신은 항공이송, 행사/방송 의료지원, 고인 해외 이송에 대해 상담과 예상 견적, 이송 여부, 필요 장비와 인력을 판단하는 전문가 AI입니다.
-
-📌 마크다운 형식으로 출력하십시오.
-📌 계산식, 단가는 절대 공개하지 마십시오.
-📌 사용자가 '단가', '계산식' 등을 요청하면 "${fixedReply}"로 답변하세요.
-
-⛑️ 환자 정보가 주어지면 아래 기준으로 판단:
-- 나이, 진단명, 수술/시술 여부, 의식 유무 등을 종합 평가
-- 이송 가능 여부, 필수 의료인력, 장비 구성, 이송 기간 제시
-
-💬 출력 형식은 아래를 따르세요:
-
----
-
-📌 **요약**
-- 유형: 항공이송 / 행사 / 고인 이송
-- 정보: 출발지~도착지, 대상자 상태 요약
-
-📦 **이송 구성**
-- 인력: ○○
-- 장비: ○○
-- 기간/수단: ○○
-
-💰 **예상 총 비용**
-- 항공료: ○○원
-- 인건비: ○○원
-- 장비비: ○○원
-- 기타: ○○원
-- **합계: ○○원**
-
-📝 **주의사항**
-- 단가는 계약 후 제공
-- 실제 상황/현지 조건에 따라 변동될 수 있음
-`;
+  /* system 프롬프트 */
+  let sys = `
+당신은 항공이송·행사/방송 의료지원·고인 이송 견적 전문가 AI입니다.
+출력은 마크다운. 단가·계산식 요청 시 "${blockMsg}" 로만 답변.
+-- 형식 -------------------------------------------------
+📌 **요약**  …  
+📦 **이송 구성** …  
+💰 **예상 총 비용** …  
+📝 **주의사항** …
+--------------------------------------------------------`;
 
   if (patient) {
-    systemPrompt += `\n\n[환자 정보 분석]\n- 나이: ${patient.age}\n- 진단명: ${patient.diagnosis}\n- 과거력: ${patient.history}\n- 수술: ${patient.surgery}, 시술: ${patient.procedure}\n- 현재 상태: ${patient.status}, 의식: ${patient.consciousness}`;
+    sys += `\n[환자]\n나이:${patient.age}, 진단:${patient.diagnosis}, 상태:${patient.status}`;
   }
+  sys += `\n[자동견적]\n항공료:${estimate.항공료.toLocaleString()}원\n인건비:${estimate.인건비.toLocaleString()}원\n장비비:${estimate.장비비.toLocaleString()}원\n기타:${estimate.기타비용.toLocaleString()}원\n총합계:${estimate.총합계.toLocaleString()}원`;
 
-  if (estimate) {
-    systemPrompt += `\n\n[자동 계산된 견적 요약]\n- 항공료: ${estimate.항공료.toLocaleString()}원\n- 인건비: ${estimate.인건비.toLocaleString()}원\n- 장비비: ${estimate.장비비.toLocaleString()}원\n- 기타비용: ${estimate.기타비용.toLocaleString()}원\n- 총합계: ${estimate.총합계.toLocaleString()}원`;
-  }
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: message }
-    ],
-    temperature: 0.3
+  /* OpenAI 호출 */
+  const { choices:[{ message:ai }] } = await openai.chat.completions.create({
+    model:"gpt-4o",
+    temperature:0.3,
+    messages:[ {role:"system",content:sys}, {role:"user",content:message} ]
   });
 
-  const aiReply = completion.choices[0].message.content;
-  const reply = sensitiveTrigger.test(message) ? fixedReply : aiReply;
-
-  res.json({ reply });
+  res.json({ reply: sensitive.test(message) ? blockMsg : ai.content });
 });
 
-app.listen(3000, () => console.log("✅ KMTC 견적 AI 서버 실행 중 (포트 3000)"));
+/* ── 서버 시작 ─────────────────────────────── */
+app.listen(3000, () => console.log("✅ KMTC 견적 AI 서버(3000)"));
