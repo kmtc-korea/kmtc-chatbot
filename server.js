@@ -1,71 +1,75 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import { OpenAI } from "openai";
 
 const app = express();
-
-// 모든 출처에서 접근 허용
-app.use(cors({
-  origin: "*"
-}));
-
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+function calculateEstimate(data) {
+  const { distanceKm, days, staff, useVentilator, useECMO } = data;
+  const wages = {
+    doctor: 1000000,
+    nurse: 500000,
+    handler: 1000000,
+    staff: 400000,
+  };
+
+  let laborCost = 0;
+  staff.forEach(role => {
+    laborCost += wages[role] * days;
+  });
+
+  let equipmentCost = 4500000 * days;
+  if (useVentilator) equipmentCost += 5000000 * days;
+  if (useECMO) equipmentCost += 20000000 * days;
+
+  const flightCost = distanceKm * 150 * 6; // 민항기 스트레쳐 기준
+  const total = laborCost + equipmentCost + flightCost;
+
+  return {
+    항공료: flightCost,
+    인건비: laborCost,
+    장비비: equipmentCost,
+    총합계: total
+  };
+}
+
 app.post("/chat", async (req, res) => {
-  const { message } = req.body;
+  const { message, patient, transportData } = req.body;
+
+  const estimate = transportData ? calculateEstimate(transportData) : null;
+
+  let aiContext = `당신은 전문 견적 및 의학적 상담 AI입니다. 사용자가 항공이송, 행사·방송 의료지원, 고인 이송 요청 시 상황을 파악하고 적절한 인력, 장비, 기간, 이송 여부를 판단하여 정리해줍니다.`;
+
+  if (patient) {
+    aiContext += `\n\n[환자 정보]\n- 나이: ${patient.age}\n- 질병: ${patient.diagnosis}\n- 과거력: ${patient.history}\n- 수술여부: ${patient.surgery}\n- 시술여부: ${patient.procedure}\n- 현재 상태: ${patient.status}\n- 의식 유무: ${patient.consciousness}`;
+    aiContext += `\n\n위 정보를 토대로 이송 가능 여부, 필요한 의료 인원, 장비, 예상 이송일 등을 제시하세요.`;
+  }
+
+  if (estimate) {
+    aiContext += `\n\n[계산된 견적]\n- 항공료: ${estimate.항공료.toLocaleString()}원\n- 인건비: ${estimate.인건비.toLocaleString()}원\n- 장비비: ${estimate.장비비.toLocaleString()}원\n- 총합계: ${estimate.총합계.toLocaleString()}원`;
+  }
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      {
-        role: "system",
-        content: `당신은 전문 견적 및 의학적 상담 AI입니다. 상황에 따라 항공이송, 행사·방송 의료지원, 고인 이송 등의 요청에 대해 정확하고 구체적인 견적을 산출하고 상담을 진행해야 합니다.
-
-[기본 지침]
-- 모든 항목은 한국 원화 기준으로 계산합니다.
-- 기본 산정 기준은 1일 단위입니다.
-- 인건비, 장비비, 항공료, 약품비, 방역비, 숙식비, 교통비 등을 포함합니다.
-- 항공이송 시 의료팀 항공료는 왕복이며, 환자는 스트레처 탑승 기준으로 6좌석이 필요합니다.
-- 각 요청 유형별로 항목별 구분(섹션 및 표 포함)으로 출력하며, 전체 비용도 합산하여 제공해야 합니다.
-
-[항공이송 지침]
-- 의료 인건비: 의사(₩1,000,000/1일), 간호사·응급구조사(₩500,000/1일), 핸들러(₩1,000,000/1일), 장비 담당자·스텝(₩400,000/1일)
-- 기본 의료장비 ₩4,500,000/1일, 벤틀레이터 ₩5,000,000/1일, ECMO ₩20,000,000~50,000,000 1일
-- 항공료 및 선박료 계산:
-  · 민항기: 거리 x 150원 x 6좌석(환자), 의료팀 인원당 거리x150원x 왕복 국제유가 및 환율에 따라변동될수 있음
-  · 비즈니스석(의료팀): 거리 x 300원 x 인원 , 비즈니스석(환자): 거리 x 350원 국제유가 및 환율에 따라변동될수 있음 ,의료팀 현지출발 편도비용은 민항기 편도 가격과 동일
-  · 전용기/에어앰뷸런스: 거리 x 15,000원
-  · 선박료 : 선박은 제주,중국,일본 근접국가만 가능함 비용은 거리 x 3,300원 x 탑승인원 (의료팀의 경우 왕복비용)
-- 구급차: 현지 ₩3,000,000 / 국내 10km 1,300원 + 추가 km당 1,000원 / 활주로 진입 ₩400,000 x2 국내구급차의 경우 심야할증이 있으므로 시간대에 맞게 정확하게 견적 (새벽1시부터 새벽5시까지 총 요금의 20% 가산)
-- 기본 3일 기준, 숙식 및 교통비 포함
-- 환자상태(의무기록, 영상자료, 투약기록 등)에 따라 이송 여부 판단 필요
-
-[행사 및 방송 의료지원 지침]
-- 인건비: 전문의 ₩650,000, 일반의 ₩550,000, 간호사/응급구조사 ₩250,000, 조무사 ₩150,000, 의료스텝 ₩150,000
-- 의료장비렌탈료: 1일 ₩300,000
-- 의약품: 모이는 인원수 기준(100명~1000명 이상) 1SET 기준 ₩200,000~₩650,000 + 시중가
-- 방역비: 손소독기 ₩130,000, 열화상카메라 ₩200,000, 방역요원 ₩150,000 등
-
-[해외 고인 이송 지침]
-- 장례 이송용 국내 운구차 국내: 거리 x 2,900원
-- 시신으로 들어올때 비용 앰바밍, 특수관, 현지 장의차: 약 ₩15,000,000
-- 화장하지 않고 관으로 들어올경우 운구 인원당 ₩200,000
-- 현지 화장시 비용 및 부대비용 : 약 ₩3,500,000 (국가별 상이)
-- 서류 준비 및 핸들링비용 (서류 비용도 포함): 약 ₩2,000,000
-- 항공료: 시신이 관으로 들어올경우 약 ₩5,000,000~₩7,000,000 / 유골함은 ₩1,000,000~₩1,500,000
-
-[출력 예시]
-- 각 견적은 “항공료 / 인건비 / 장비비 / 숙식비 / 기타비용” 순으로 구분해 표 형태로 제시하고, 총합계를 반드시 제공합니다.
-- 각 항목 앞에 아이콘(예: 💰 비용 / 🧑‍⚕️ 인력 / ✈️ 항공료 등)을 넣어 가독성을 높이십시오.
-- 내용은 사용자가 요청한 상황에 맞게 판단하여 분기하십시오.`
-      },
+      { role: "system", content: aiContext },
       { role: "user", content: message }
     ],
+    temperature: 0.4,
+    max_tokens: 2000
   });
 
-  res.json({ reply: response.choices[0].message.content });
+  const aiReply = response.choices[0].message.content;
+  const sensitiveTrigger = /단가|계산식|어떻게 나온|근거|세부.*금액/i;
+  const fixedReply = "📌 해당 정보는 계약 체결 후 제공 가능한 내부 기준입니다. 양해 부탁드립니다.";
+
+  const reply = sensitiveTrigger.test(message) ? fixedReply : aiReply;
+  res.json({ reply });
 });
 
-app.listen(3000, () => console.log("Server running"));
+app.listen(3000, () => console.log("✅ KMTC 상담서버 실행 중 on port 3000"));
