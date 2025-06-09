@@ -3,7 +3,12 @@ import cors from "cors";
 import { OpenAI } from "openai";
 
 const app = express();
-app.use(cors());
+
+// 🔥 모든 출처에서 접근 허용
+app.use(cors({
+  origin: "*"
+}));
+
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
