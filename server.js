@@ -1,4 +1,10 @@
-/* backend/index.js – KMTC AI 2025-06-10 (v10 ― Google DM API) */
+/* backend/index.js – KMTC AI 2025-06-10 (v11)
+   · GPT-4o type / cremated 판정
+   · 공항 좌표 캐시(IATA→Nominatim) + Google Distance Matrix
+   · 지오코딩 3-단계 + “도시 국가” ↔ “도시, 국가” 자동 뒤집기
+   · ‘항공/고인’만 주소 필수, 행사 의료지원은 주소 불필요
+   · BOM 제거 후 JSON.parse
+*/
 
 import express from "express";
 import cors    from "cors";
@@ -6,53 +12,64 @@ import { config } from "dotenv";
 import fetch   from "node-fetch";
 import haversine from "haversine-distance";
 import { OpenAI } from "openai";
-import fs from "fs";
+import fs   from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/* ── JSON 로드(BOM 제거) ── */
-const stripBom = b => b.toString("utf8").replace(/^\uFEFF/, "");
-const airportsInit = JSON.parse(stripBom(fs.readFileSync(path.join(__dirname,"data/airports.json"))));
-const countries    = JSON.parse(stripBom(fs.readFileSync(path.join(__dirname,"data/countries.json"))));
+/* ── JSON 로드 (BOM 제거) ── */
+const strip = b => b.toString("utf8").replace(/^\uFEFF/, "");
+const airportsInit = JSON.parse(strip(fs.readFileSync(path.join(__dirname,"data/airports.json"))));
+const countries    = JSON.parse(strip(fs.readFileSync(path.join(__dirname,"data/countries.json"))));
 
-/* ── Express ── */
+/* ── App ── */
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-/* ── 단가표 ── */
+/* ── 표준 단가 ── */
 const wages={doctor:1_000_000,nurse:500_000,handler:1_000_000,staff:400_000};
 const equipCost={ventilator:5_000_000,ecmo:20_000_000,base:4_500_000};
 const medCost={high:400_000,medium:200_000,low:100_000};
-const ACC=250_000,SHIP=3_300,CHARTER=15_000;
+const ACC=250_000, SHIP=3_300, CHARTER=15_000;
 
-/* ── 공항 캐시 ── */
-const airportCache=Object.fromEntries(
+/* ── 공항 좌표 캐시 ── */
+const aCache=Object.fromEntries(
   airportsInit.filter(a=>a.iata_code)
-    .map(a=>[a.iata_code.toLowerCase(),{lat:+a.latitude_deg,lon:+a.longitude_deg}])
+              .map(a=>[a.iata_code.toLowerCase(),{lat:+a.latitude_deg,lon:+a.longitude_deg}])
 );
 async function airportCoord(iata){
   const k=iata.toLowerCase();
-  if(airportCache[k]) return airportCache[k];
+  if(aCache[k]) return aCache[k];
   const url=`https://nominatim.openstreetmap.org/search?q=${iata}%20airport&format=json&limit=1`;
   const js=await fetch(url,{headers:{'User-Agent':'kmtc'}}).then(r=>r.json());
   if(!js.length) throw new Error("AIRPORT_NOT_FOUND");
-  airportCache[k]={lat:+js[0].lat,lon:+js[0].lon};
-  return airportCache[k];
+  return (aCache[k]={lat:+js[0].lat,lon:+js[0].lon});
 }
 
 /* ── “…에서 …까지” 파싱 ── */
 const parseLoc=t=>{const m=t.match(/(.+?)에서\s+(.+?)까지/);return m?{depLoc:m[1].trim(),arrLoc:m[2].trim()}:{};};
 
-/* ── 주소 → 좌표 (3-단계) ── */
+/* ── 주소 → 좌표 (뒤집기 + 3-단계) ── */
 async function geocode(addr){
   const base="https://nominatim.openstreetmap.org/search?";
   const opt ="&format=json&limit=1&accept-language=ko,en";
-  for(const q of [addr,...countries.flatMap(c=>[`${addr} ${c.ko}`,`${addr} ${c.en}`])]){
-    const js=await fetch(base+"q="+encodeURIComponent(q)+opt,{headers:{'User-Agent':'kmtc'}}).then(r=>r.json());
+
+  /* ① “도시 국가” → “도시, 국가” 플립 */
+  let flipped = addr;
+  const parts = addr.split(/\s+/);
+  if (parts.length>=2){
+    const countryWord = parts.pop();
+    flipped = `${parts.join(" ")}, ${countryWord}`;
+  }
+
+  const queries = [addr, flipped,
+                   ...countries.flatMap(c=>[`${addr} ${c.ko}`,`${addr} ${c.en}`])];
+
+  for(const q of queries){
+    const js=await fetch(`${base}q=${encodeURIComponent(q)}${opt}`,{headers:{'User-Agent':'kmtc'}}).then(r=>r.json());
     if(js.length) return {lat:+js[0].lat,lon:+js[0].lon};
   }
   throw new Error("NOT_FOUND");
@@ -64,26 +81,22 @@ async function gmapsDistance(from,to){
   const url=`https://maps.googleapis.com/maps/api/distancematrix/json?origins=${from.lat},${from.lon}&destinations=${to.lat},${to.lon}&key=${key}`;
   const js=await fetch(url).then(r=>r.json());
   if(js.status!=="OK") throw new Error("DIST_FAIL");
-  const elem=js.rows[0].elements[0];
-  return { km:+(elem.distance.value/1000).toFixed(0),
-           hr:+(elem.duration.value/3600).toFixed(1) };
+  const e=js.rows[0].elements[0];
+  return{km:+(e.distance.value/1000).toFixed(0),hr:+(e.duration.value/3600).toFixed(1)};
 }
 
-/* ── 거리·시간 · 구간 합치기 ── */
+/* ── 거리·시간 ── */
 async function routeInfo(depLoc,arrLoc,depIata,arrIata){
-  const from = await geocode(depLoc);
-  const to   = await geocode(arrLoc);
-  const depA = await airportCoord(depIata);
-  const arrA = await airportCoord(arrIata);
-
-  return {
-    leg1 : await gmapsDistance(from, depA),   // 구급차
-    leg2 : await gmapsDistance(depA, arrA),   // 항공 (직선거리로 충분)
-    leg3 : await gmapsDistance(arrA, to)      // 도착지 구급차
+  const from=await geocode(depLoc), to=await geocode(arrLoc);
+  const depA=await airportCoord(depIata), arrA=await airportCoord(arrIata);
+  return{
+    leg1:await gmapsDistance(from,depA),
+    leg2:await gmapsDistance(depA,arrA),
+    leg3:await gmapsDistance(arrA,to)
   };
 }
 
-/* ── GPT 계획 ── */
+/* ── GPT 플랜 ── */
 const openai=new OpenAI({apiKey:process.env.OPENAI_API_KEY});
 async function gptPlan(patient,km){
   const sys=`JSON ONLY:
@@ -93,8 +106,8 @@ async function gptPlan(patient,km){
   return JSON.parse(message.content.trim());
 }
 
-/* ── 비용 계산 (동일) ── */
-function calcCost(ctx,plan,km,days){
+/* ── 비용 계산 ── */
+function cost(ctx,plan,km,days){
   const c={항공료:0,인건비:0,장비비:0,숙식:ACC*plan.staff.length*days,기타:3_000_000+400_000*2};
   plan.staff.forEach(s=>{if(wages[s])c.인건비+=wages[s]*days;});
   c.장비비=equipCost.base*days+(plan.equipment.ventilator?equipCost.ventilator*days:0)+(plan.equipment.ecmo?equipCost.ecmo*days:0)+medCost[plan.medLvl]*days;
@@ -117,17 +130,16 @@ const sessions={};
 
 /* ── /chat ── */
 app.post("/chat",async(req,res)=>{
-  const {sessionId="default",message="",depLoc="",arrLoc="",depAirport="sgnh",arrAirport="icn",days=3,patient={}}=req.body;
+  const {sessionId="def",message="",depLoc="",arrLoc="",depAirport="sgnh",arrAirport="icn",days=3,patient={}}=req.body;
   const ses=sessions[sessionId] ||= {};
   if(Object.keys(patient).length) ses.patient={...ses.patient,...patient};
 
-  const plan0 = await gptPlan(ses.patient||{},0);
+  const plan0=await gptPlan(ses.patient||{},0);
   const ctx = plan0.type==="funeral"?"고인이송":plan0.type==="event"?"행사의료지원":"항공이송";
   const needAddr = ctx!=="행사의료지원";
 
   const auto=parseLoc(message);
-  const from=depLoc||auto.depLoc;
-  const to  =arrLoc||auto.arrLoc;
+  const from=depLoc||auto.depLoc, to=arrLoc||auto.arrLoc;
   if(needAddr && (!from||!to))
     return res.json({reply:"📝 \"…에서 …까지\" 형식 또는 출발·도착 주소를 입력해 주세요."});
 
@@ -137,11 +149,11 @@ app.post("/chat",async(req,res)=>{
     catch{return res.json({reply:"⚠️ 위치 검색 실패. 주소를 다시 확인해 주세요."});}
   }
 
-  const plan= km ? await gptPlan(ses.patient||{},km) : plan0;
+  const plan = km ? await gptPlan(ses.patient||{},km) : plan0;
   if(ctx==="고인이송") plan.seat="coffin";
 
-  const cost=calcCost(ctx,plan,km,days);
-  const fmt=n=>`약 ${n.toLocaleString()}원`;
+  const c = cost(ctx,plan,km,days);
+  const fmt = n=>`약 ${n.toLocaleString()}원`;
 
   res.json({reply:`
 ### 📝 이송 요약
@@ -159,12 +171,12 @@ app.post("/chat",async(req,res)=>{
 ### 💰 예상 비용
 |항목|금액|
 |---|---|
-|✈️ 항공료|${fmt(cost.항공료)}|
-|🧑‍⚕️ 인건비|${fmt(cost.인건비)}|
-|🛠️ 장비·약품|${fmt(cost.장비비)}|
-|🏨 숙식|${fmt(cost.숙식)}|
-|기타|${fmt(cost.기타)}|
-|**합계**|**${fmt(cost.총)}**|
+|✈️ 항공료|${fmt(c.항공료)}|
+|🧑‍⚕️ 인건비|${fmt(c.인건비)}|
+|🛠️ 장비·약품|${fmt(c.장비비)}|
+|🏨 숙식|${fmt(c.숙식)}|
+|기타|${fmt(c.기타)}|
+|**합계**|**${fmt(c.총)}**|
 
 ### 🔧 장비·약품
 - 장비: ${(plan.equipment.ventilator?"벤틀레이터, ":"")+(plan.equipment.ecmo?"ECMO, ":"")}기본세트
