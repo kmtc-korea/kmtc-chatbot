@@ -1,4 +1,4 @@
-/* backend/server.js – KMTC AI 2025-06-10 (v12.3)
+/* backend/server.js – KMTC AI 2025-06-10 (v12.4)
    · GPT-4o type / cremated 판정
    · Google Geocoding API → 실패 시 OSM(Nominatim) 3-단계
    · Google Distance Matrix API 로 단일 구간 거리·시간
@@ -156,17 +156,19 @@ app.post("/chat", async (req, res) => {
     patient   = {}
   } = req.body;
 
-  // 일반 문의 vs 견적 요청
-  if (!/(이송|견적|비용)/.test(message)) {
+  // ——— “견적”/“비용” 질문만 비용 로직, 나머지는 일반 챗으로 처리 ———
+  if (!/(견적|비용|얼마|요금)/.test(message)) {
     const chat = await openai.chat.completions.create({
       model: "gpt-4o", temperature: 0.7,
       messages: [
-        { role: "system", content: "당신은 KMTC AI 상담원입니다. 환자 이송 외 일반 문의에 답해주세요." },
-        { role: "user",   content: message }
+        { role:"system", content:
+          "당신은 KMTC AI 상담원입니다. 환자 이송 절차나 개념, 행사·방송 의료지원, 고인 이송 등 일반 문의에도 답변해주세요." },
+        { role:"user",   content: message }
       ]
     });
     return res.json({ reply: chat.choices[0].message.content.trim() });
   }
+  // ——————————————————————————————————————————————
 
   const ses = sessions[sessionId] ||= {};
   if (Object.keys(patient).length) {
