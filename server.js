@@ -1,15 +1,9 @@
-/* backend/index.js – KMTC AI 2025-06-10 (v9 BOM safe)
-   · GPT-4o 가 type / cremated 판정
-   · 공항 좌표 자동 캐시 (IATA → Nominatim)
-   · 지오코딩 3-단계(원문 → 국가명 붙여 재조회)
-   · ‘항공/고인’만 주소 필수, 행사 의료지원은 주소 불필요
-   · UTF-8 BOM 제거 후 JSON.parse — “��[” 오류 해결
-*/
+/* backend/index.js – KMTC AI 2025-06-10 (v10 ― Google DM API) */
 
 import express from "express";
-import cors from "cors";
+import cors    from "cors";
 import { config } from "dotenv";
-import fetch from "node-fetch";
+import fetch   from "node-fetch";
 import haversine from "haversine-distance";
 import { OpenAI } from "openai";
 import fs from "fs";
@@ -19,25 +13,25 @@ import { fileURLToPath } from "url";
 config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/* ────── JSON 로드(BOM 제거) ────── */
-const stripBom = buf => buf.toString("utf8").replace(/^\uFEFF/, "");
+/* ── JSON 로드(BOM 제거) ── */
+const stripBom = b => b.toString("utf8").replace(/^\uFEFF/, "");
 const airportsInit = JSON.parse(stripBom(fs.readFileSync(path.join(__dirname,"data/airports.json"))));
 const countries    = JSON.parse(stripBom(fs.readFileSync(path.join(__dirname,"data/countries.json"))));
 
+/* ── Express ── */
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-/* ── 단가표 ─────────────────────── */
-const wages     = { doctor:1_000_000, nurse:500_000, handler:1_000_000, staff:400_000 };
-const equipCost = { ventilator:5_000_000, ecmo:20_000_000, base:4_500_000 };
-const medCost   = { high:400_000, medium:200_000, low:100_000 };
-const ACC=250_000, SHIP=3_300, CHARTER=15_000;
+/* ── 단가표 ── */
+const wages={doctor:1_000_000,nurse:500_000,handler:1_000_000,staff:400_000};
+const equipCost={ventilator:5_000_000,ecmo:20_000_000,base:4_500_000};
+const medCost={high:400_000,medium:200_000,low:100_000};
+const ACC=250_000,SHIP=3_300,CHARTER=15_000;
 
-/* ── 공항 캐시 ──────────────────── */
-const airportCache = Object.fromEntries(
-  airportsInit
-    .filter(a=>a.iata_code)
+/* ── 공항 캐시 ── */
+const airportCache=Object.fromEntries(
+  airportsInit.filter(a=>a.iata_code)
     .map(a=>[a.iata_code.toLowerCase(),{lat:+a.latitude_deg,lon:+a.longitude_deg}])
 );
 async function airportCoord(iata){
@@ -50,9 +44,10 @@ async function airportCoord(iata){
   return airportCache[k];
 }
 
-/* ── 위치 파싱·지오코딩 ─────────── */
-const parseLoc=t=>{const m=t.match(/(.+?)에서\s+(.+?)까지/);return m?{depLoc:m[1].trim(),arrLoc:m[2].trim()}:{}};
+/* ── “…에서 …까지” 파싱 ── */
+const parseLoc=t=>{const m=t.match(/(.+?)에서\s+(.+?)까지/);return m?{depLoc:m[1].trim(),arrLoc:m[2].trim()}:{};};
 
+/* ── 주소 → 좌표 (3-단계) ── */
 async function geocode(addr){
   const base="https://nominatim.openstreetmap.org/search?";
   const opt ="&format=json&limit=1&accept-language=ko,en";
@@ -63,17 +58,32 @@ async function geocode(addr){
   throw new Error("NOT_FOUND");
 }
 
-/* ── 거리·시간 ──────────────────── */
-const distKm=(a,b)=>haversine(a,b)/1000;
-const hr=(km,s)=>+(km/s).toFixed(1);
-const seg=async(f,t,v)=>{const km=distKm(f,t);return{km:+km.toFixed(0),hr:hr(km,v)}};
-async function routeInfo(depLoc,arrLoc,depIata,arrIata){
-  const from=await geocode(depLoc),to=await geocode(arrLoc);
-  const depA=await airportCoord(depIata),arrA=await airportCoord(arrIata);
-  return{leg1:await seg(from,depA,50),leg2:await seg(depA,arrA,800),leg3:await seg(arrA,to,40)};
+/* ── Google Distance Matrix ── */
+async function gmapsDistance(from,to){
+  const key=process.env.GMAPS_KEY;
+  const url=`https://maps.googleapis.com/maps/api/distancematrix/json?origins=${from.lat},${from.lon}&destinations=${to.lat},${to.lon}&key=${key}`;
+  const js=await fetch(url).then(r=>r.json());
+  if(js.status!=="OK") throw new Error("DIST_FAIL");
+  const elem=js.rows[0].elements[0];
+  return { km:+(elem.distance.value/1000).toFixed(0),
+           hr:+(elem.duration.value/3600).toFixed(1) };
 }
 
-/* ── GPT 플랜 ───────────────────── */
+/* ── 거리·시간 · 구간 합치기 ── */
+async function routeInfo(depLoc,arrLoc,depIata,arrIata){
+  const from = await geocode(depLoc);
+  const to   = await geocode(arrLoc);
+  const depA = await airportCoord(depIata);
+  const arrA = await airportCoord(arrIata);
+
+  return {
+    leg1 : await gmapsDistance(from, depA),   // 구급차
+    leg2 : await gmapsDistance(depA, arrA),   // 항공 (직선거리로 충분)
+    leg3 : await gmapsDistance(arrA, to)      // 도착지 구급차
+  };
+}
+
+/* ── GPT 계획 ── */
 const openai=new OpenAI({apiKey:process.env.OPENAI_API_KEY});
 async function gptPlan(patient,km){
   const sys=`JSON ONLY:
@@ -83,7 +93,7 @@ async function gptPlan(patient,km){
   return JSON.parse(message.content.trim());
 }
 
-/* ── 비용 계산 ───────────────────── */
+/* ── 비용 계산 (동일) ── */
 function calcCost(ctx,plan,km,days){
   const c={항공료:0,인건비:0,장비비:0,숙식:ACC*plan.staff.length*days,기타:3_000_000+400_000*2};
   plan.staff.forEach(s=>{if(wages[s])c.인건비+=wages[s]*days;});
@@ -91,8 +101,8 @@ function calcCost(ctx,plan,km,days){
   if(ctx==="고인이송"){
     if(plan.cremated){c.항공료=1_250_000;c.기타+=3_500_000;}
     else{c.항공료=6_000_000;c.기타+=15_000_000;}
-  }else if(plan.transport==="ship")                 c.항공료=km*SHIP*(1+plan.staff.length*2);
-  else if(plan.transport!=="civil")                 c.항공료=km*CHARTER;
+  }else if(plan.transport==="ship")      c.항공료=km*SHIP*(1+plan.staff.length*2);
+  else if(plan.transport!=="civil")      c.항공료=km*CHARTER;
   else{
     c.항공료+=plan.seat==="stretcher"?km*150*6:km*350;
     c.항공료+=km*150*plan.staff.length;
@@ -102,36 +112,36 @@ function calcCost(ctx,plan,km,days){
   return c;
 }
 
-/* ── 세션 ───────────────────────── */
+/* ── 세션 ── */
 const sessions={};
 
-/* ── /chat ──────────────────────── */
+/* ── /chat ── */
 app.post("/chat",async(req,res)=>{
   const {sessionId="default",message="",depLoc="",arrLoc="",depAirport="sgnh",arrAirport="icn",days=3,patient={}}=req.body;
   const ses=sessions[sessionId] ||= {};
   if(Object.keys(patient).length) ses.patient={...ses.patient,...patient};
 
-  const plan0 = await gptPlan(ses.patient||{},0);             // type 판정
+  const plan0 = await gptPlan(ses.patient||{},0);
   const ctx = plan0.type==="funeral"?"고인이송":plan0.type==="event"?"행사의료지원":"항공이송";
   const needAddr = ctx!=="행사의료지원";
 
   const auto=parseLoc(message);
   const from=depLoc||auto.depLoc;
   const to  =arrLoc||auto.arrLoc;
-  if(needAddr &&(!from||!to))
+  if(needAddr && (!from||!to))
     return res.json({reply:"📝 \"…에서 …까지\" 형식 또는 출발·도착 주소를 입력해 주세요."});
 
   let legs={leg1:{km:0,hr:0},leg2:{km:0,hr:0},leg3:{km:0,hr:0}}, km=0;
   if(needAddr){
-    try{legs=await routeInfo(from,to,depAirport,arrAirport);km=legs.leg2.km;}
+    try{legs=await routeInfo(from,to,depAirport,arrAirport); km=legs.leg2.km;}
     catch{return res.json({reply:"⚠️ 위치 검색 실패. 주소를 다시 확인해 주세요."});}
   }
 
-  const plan = km? await gptPlan(ses.patient||{},km): plan0;
+  const plan= km ? await gptPlan(ses.patient||{},km) : plan0;
   if(ctx==="고인이송") plan.seat="coffin";
 
-  const cost = calcCost(ctx,plan,km,days);
-  const fmt  = n=>`약 ${n.toLocaleString()}원`;
+  const cost=calcCost(ctx,plan,km,days);
+  const fmt=n=>`약 ${n.toLocaleString()}원`;
 
   res.json({reply:`
 ### 📝 이송 요약
