@@ -11,9 +11,16 @@ import { config } from "dotenv";
 import fetch   from "node-fetch";
 import haversine from "haversine-distance";
 import { OpenAI } from "openai";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-import airportsInit from "./data/airports.json"  assert {type:"json"};
-import countries    from "./data/countries.json" assert {type:"json"};
+config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/* ────── JSON 파일 수동 로드 ────── */
+const airportsInit = JSON.parse(fs.readFileSync(path.join(__dirname,"data/airports.json")));
+const countries    = JSON.parse(fs.readFileSync(path.join(__dirname,"data/countries.json")));
 
 config();
 const app = express();
