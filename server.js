@@ -1,4 +1,4 @@
-/* backend/server.js – KMTC AI 2025-06-10 (v12.7)
+/* backend/server.js – KMTC AI 2025-06-10 (v12.8)
    · GPT-4o type / cremated 판정
    · Google Geocoding API → 실패 시 OSM(Nominatim) 3-단계
    · Google Distance Matrix API 로 단일 구간 거리·시간
@@ -28,176 +28,243 @@ const countries = JSON.parse(strip(
 
 /* ---------- Geocoding & Distance ---------- */
 async function googleGeocode(q) {
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?key=${GMAPS_KEY}`
-            + `&address=${encodeURIComponent(q)}&language=ko`;
+  const url = `https://maps.googleapis.com/maps/api/geocode/json?key=${GMAPS_KEY}` +
+              `&address=${encodeURIComponent(q)}&language=ko`;
   const js  = await fetch(url).then(r => r.json());
-  if (js.status === "OK") return { lat: js.results[0].geometry.location.lat, lon: js.results[0].geometry.location.lng };
+  if (js.status === "OK") return {
+    lat: js.results[0].geometry.location.lat,
+    lon: js.results[0].geometry.location.lng
+  };
   throw new Error("G_FAIL");
 }
+
 async function osmGeocode(q) {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1`;
-  const js  = await fetch(url,{headers:{"User-Agent":"kmtc"}}).then(r=>r.json());
-  if(js.length) return { lat:+js[0].lat, lon:+js[0].lon };
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}` +
+              `&format=json&limit=1`;
+  const js  = await fetch(url, { headers: { "User-Agent": "kmtc" } }).then(r => r.json());
+  if (js.length) return { lat: +js[0].lat, lon: +js[0].lon };
   throw new Error("OSM_FAIL");
 }
+
 async function geocode(addr) {
   try { return await googleGeocode(addr); } catch {}
-  const p = addr.trim().split(/\s+/);
-  if(p.length>=2){
-    try { return await googleGeocode(`${p.slice(0,-1).join(" ")}, ${p.at(-1)}`); } catch {}
+  const parts = addr.trim().split(/\s+/);
+  if (parts.length >= 2) {
+    try {
+      return await googleGeocode(`${parts.slice(0, -1).join(" ")}, ${parts.at(-1)}`);
+    } catch {}
   }
-  for(const q of [addr,...countries.flatMap(c=>[`${addr} ${c.ko}`,`${addr} ${c.en}`])]){
-    try{ return await googleGeocode(q) }catch{}
-    try{ return await osmGeocode(q) }catch{}
+  for (const q of [
+    addr,
+    ...countries.flatMap(c => [`${addr} ${c.ko}`, `${addr} ${c.en}`])
+  ]) {
+    try { return await googleGeocode(q); } catch {}
+    try { return await osmGeocode(q); } catch {}
   }
   throw new Error("NOT_FOUND");
 }
-async function gDist(o,d){
-  const url = `https://maps.googleapis.com/maps/api/distancematrix/json`
-            + `?origins=${o.lat},${o.lon}&destinations=${d.lat},${d.lon}&key=${GMAPS_KEY}`;
-  const js = await fetch(url).then(r=>r.json());
-  if(js.status!=="OK") throw new Error("DIST_FAIL");
-  const e = js.rows[0].elements[0];
-  return { km:+(e.distance.value/1000).toFixed(0), hr:+(e.duration.value/3600).toFixed(1) };
-}
-async function routeInfo(dep,arr){ return await gDist(await geocode(dep), await geocode(arr)); }
 
-/* ---------- OpenAI & 기획 ---------- */
+async function gDist(o, d) {
+  const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
+              `?origins=${o.lat},${o.lon}` +
+              `&destinations=${d.lat},${d.lon}` +
+              `&key=${GMAPS_KEY}`;
+  const js = await fetch(url).then(r => r.json());
+  if (js.status !== "OK") throw new Error("DIST_FAIL");
+  const e = js.rows[0].elements[0];
+  return {
+    km: +(e.distance.value / 1000).toFixed(0),
+    hr: +(e.duration.value / 3600).toFixed(1)
+  };
+}
+
+async function routeInfo(dep, arr) {
+  const from = await geocode(dep);
+  const to   = await geocode(arr);
+  return await gDist(from, to);
+}
+
+/* ---------- OpenAI & 플랜 생성 ---------- */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-async function gptPlan(patient,km){
-  const sys=`JSON ONLY:
+
+async function gptPlan(patient, km) {
+  const sys = `JSON ONLY:
 {"type":"air|funeral|event","cremated":bool,"risk":"low|medium|high","transport":"civil|airAmbulance|charter|ship","seat":"business|stretcher","staff":["doctor","nurse"],"equipment":{"ventilator":bool,"ecmo":bool},"medLvl":"low|medium|high","notes":["..."]}`;
-  const usr=`진단:${patient.diagnosis||"unknown"} / 의식:${patient.consciousness||"unknown"} / 거동:${patient.mobility||"unknown"} / 거리:${km}`;
-  const {choices:[{message}]}=await openai.chat.completions.create({
-    model:"gpt-4o",temperature:0.2,
-    messages:[{role:"system",content:sys},{role:"user",content:usr}]
+  const usr = `진단:${patient.diagnosis||"unknown"} / 의식:${patient.consciousness||"unknown"} / 거동:${patient.mobility||"unknown"} / 거리:${km}`;
+  const { choices:[{ message }] } = await openai.chat.completions.create({
+    model: "gpt-4o",
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user",   content: usr }
+    ]
   });
   return JSON.parse(message.content.trim());
 }
 
 /* ---------- 비용 계산 ---------- */
-const wages={doctor:1_000_000,nurse:500_000,handler:1_000_000,staff:400_000};
-const equip ={ventilator:5_000_000,ecmo:20_000_000,base:4_500_000};
-const meds  ={high:400_000,medium:200_000,low:100_000};
-const ACC   =250_000;
-function calcCost(ctx,plan,km,days){
-  const c={항공료:0,인건비:0,장비비:0,숙식:ACC*plan.staff.length*days,기타:3_000_000+400_000*2};
-  plan.staff.forEach(r=>{ if(wages[r]) c.인건비+=wages[r]*days; });
-  c.장비비 = equip.base*days
-           + (plan.equipment.ventilator?equip.ventilator*days:0)
-           + (plan.equipment.ecmo?equip.ecmo*days:0)
-           + meds[plan.medLvl]*days;
-  if(ctx==="고인이송"){
-    if(plan.cremated){ c.항공료=1_250_000; c.기타+=3_500_000; }
-    else             { c.항공료=6_000_000; c.기타+=15_000_000; }
-  } else if(plan.transport==="ship"){
-    c.항공료 = km*3_300*(1+plan.staff.length*2);
-  } else if(plan.transport!=="civil"){
-    c.항공료 = km*15_000;
+const wages = { doctor:1_000_000, nurse:500_000, handler:1_000_000, staff:400_000 };
+const equip  = { ventilator:5_000_000, ecmo:20_000_000, base:4_500_000 };
+const meds   = { high:400_000, medium:200_000, low:100_000 };
+const ACC    = 250_000;
+
+function calcCost(ctx, plan, km, days) {
+  const c = {
+    항공료: 0,
+    인건비: 0,
+    장비비: 0,
+    숙식: ACC * plan.staff.length * days,
+    기타: 3_000_000 + 400_000 * 2
+  };
+  plan.staff.forEach(r => {
+    if (wages[r]) c.인건비 += wages[r] * days;
+  });
+  c.장비비 = equip.base * days
+           + (plan.equipment.ventilator ? equip.ventilator * days : 0)
+           + (plan.equipment.ecmo ? equip.ecmo * days : 0)
+           + meds[plan.medLvl] * days;
+
+  if (ctx === "고인이송") {
+    if (plan.cremated) {
+      c.항공료 = 1_250_000;
+      c.기타   += 3_500_000;
+    } else {
+      c.항공료 = 6_000_000;
+      c.기타   += 15_000_000;
+    }
+  } else if (plan.transport === "ship") {
+    c.항공료 = km * 3_300 * (1 + plan.staff.length * 2);
+  } else if (plan.transport !== "civil") {
+    c.항공료 = km * 15_000;
   } else {
-    c.항공료 += plan.seat==="stretcher"?km*150*6:km*350;
-    c.항공료 += km*150*plan.staff.length;
-    c.항공료 += km*(plan.seat==="business"?300:150)*plan.staff.length;
+    c.항공료 += plan.seat === "stretcher" ? km * 150 * 6 : km * 350;
+    c.항공료 += km * 150 * plan.staff.length;
+    c.항공료 += km * (plan.seat === "business" ? 300 : 150) * plan.staff.length;
   }
-  c.총 = Object.values(c).reduce((a,b)=>a+b,0);
+
+  c.총 = Object.values(c).reduce((a, b) => a + b, 0);
   return c;
 }
 
 /* ---------- function-calling 스키마 ---------- */
-const functions =[{
-  name:"decideIntentAndParams",
-  description:"사용자 입력에서 intent와 파라미터를 추출합니다.",
-  parameters:{
-    type:"object",
-    properties:{
-      intent:{type:"string",enum:["GENERAL","EXPLAIN_COST","CALCULATE_COST"]},
-      from:{type:"string"}, to:{type:"string"},
-      scenarios:{type:"array",items:{type:"string"}}
+const functions = [{
+  name: "decideIntentAndParams",
+  description: "사용자 입력에서 intent와 파라미터를 추출합니다.",
+  parameters: {
+    type: "object",
+    properties: {
+      intent:    { type: "string", enum: ["GENERAL","EXPLAIN_COST","CALCULATE_COST"] },
+      from:      { type: "string" },
+      to:        { type: "string" },
+      scenarios: { type: "array", items: { type: "string" } }
     },
-    required:["intent"]
+    required: ["intent"]
   }
 }];
 
-/* ---------- Express 설정 ---------- */
-const sessions={};
-const app=express();
+/* ---------- Express 설정 및 핸들러 ---------- */
+const sessions = {};
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.post("/chat", async(req,res)=>{
-  const {sessionId="def",message="",days=3,patient={}}=req.body;
+app.post("/chat", async (req, res) => {
+  const { sessionId="def", message="", days=3, patient={} } = req.body;
   const ses = sessions[sessionId] ||= {};
-  if(Object.keys(patient).length) ses.patient={...ses.patient,...patient};
+  if (Object.keys(patient).length) ses.patient = { ...ses.patient, ...patient };
 
   // 1) intent 분류 및 파라미터 추출
   const cl = await openai.chat.completions.create({
-    model:"gpt-4o",temperature:0,
-    messages:[
-      {role:"system",content:
-        "당신은 KMTC AI입니다. 외부 업체 언급 금지. 사용자 입력을 intent와 파라미터로만 반환하세요."},
-      {role:"user",content:message}
+    model: "gpt-4o",
+    temperature: 0,
+    messages: [
+      { role:"system", content:
+        "당신은 KMTC AI입니다. 외부 업체 언급 금지. 사용자 입력을 intent와 파라미터로만 반환하세요." },
+      { role:"user",   content: message }
     ],
     functions,
-    function_call:{name:"decideIntentAndParams"}
+    function_call: { name: "decideIntentAndParams" }
   });
   const args = JSON.parse(cl.choices[0].message.function_call.arguments);
-  const {intent,from,to,scenarios=[]}=args;
+  const { intent, from, to, scenarios=[] } = args;
 
   // 2) GENERAL 문의
-  if(intent==="GENERAL"){
+  if (intent === "GENERAL") {
     const chat = await openai.chat.completions.create({
-      model:"gpt-4o",temperature:0.7,
-      messages:[
-        {role:"system",content:
-          "당신은 KMTC AI 상담원입니다. 외부 업체 추천/홍보 금지. KMTC 서비스만 안내하세요."},
-        {role:"user",content:message}
+      model: "gpt-4o",
+      temperature: 0.7,
+      messages: [
+        {
+          role: "system",
+          content:
+            "당신은 KMTC AI 상담원입니다. " +
+            "KMTC는 해외 환자 항공이송, 행사 의료지원, 방송 의료지원, 고인 이송 등 " +
+            "종합 이송 및 의료지원 서비스를 제공하는 전문 기업입니다. " +
+            "외부 업체 언급 및 홍보는 금지되며, KMTC 서비스만 안내하세요."
+        },
+        { role:"user", content: message }
       ]
     });
-    return res.json({reply:chat.choices[0].message.content.trim()});
+    return res.json({ reply: chat.choices[0].message.content.trim() });
   }
 
   // 3) 비용 구조 설명
-  if(intent==="EXPLAIN_COST"){
+  if (intent === "EXPLAIN_COST") {
     const chat = await openai.chat.completions.create({
-      model:"gpt-4o",temperature:0.7,
-      messages:[
-        {role:"system",content:
-          "당신은 KMTC AI 상담원입니다. 외부 업체 언급 금지. 비용 구조만 설명하세요."},
-        {role:"user",content:message}
+      model: "gpt-4o",
+      temperature: 0.7,
+      messages: [
+        {
+          role: "system",
+          content:
+            "당신은 KMTC AI 상담원입니다. " +
+            "외부 업체 언급 금지. 비용 구조와 형성만 설명하세요."
+        },
+        { role:"user", content: message }
       ]
     });
-    return res.json({reply:chat.choices[0].message.content.trim()});
+    return res.json({ reply: chat.choices[0].message.content.trim() });
   }
 
   // 4) 실제 계산 (CALCULATE_COST)
-  let km=0,hr=0;
-  const plan0 = await gptPlan(ses.patient||{},0);
-  const ctx = plan0.type==="funeral"?"고인이송":plan0.type==="event"?"행사의료지원":"항공이송";
-  if(ctx!=="행사의료지원"){
-    try{({km,hr}=await routeInfo(from,to));}
-    catch{return res.json({reply:"⚠️ 위치 검색 실패. 주소를 확인해주세요."});}
+  let km = 0, hr = 0;
+  const plan0 = await gptPlan(ses.patient||{}, 0);
+  const ctx = plan0.type === "funeral" ? "고인이송"
+            : plan0.type === "event"   ? "행사의료지원"
+            : "항공이송";
+  if (ctx !== "행사의료지원") {
+    try {
+      ({ km, hr } = await routeInfo(from, to));
+    } catch {
+      return res.json({ reply: "⚠️ 위치 검색 실패. 주소를 확인해주세요." });
+    }
   }
 
-  const planBase = await gptPlan(ses.patient||{},km);
-  const list = scenarios.length?scenarios:[planBase.transport];
-  const results = await Promise.all(list.map(async transport=>{
-    const plan={...planBase,transport};
-    if(ctx==="고인이송") plan.seat="coffin";
-    return {transport,total:calcCost(ctx,plan,km,days).총};
+  const planBase = await gptPlan(ses.patient||{}, km);
+  const list = scenarios.length ? scenarios : [ planBase.transport ];
+  const results = await Promise.all(list.map(async transport => {
+    const plan = { ...planBase, transport };
+    if (ctx === "고인이송") plan.seat = "coffin";
+    return { transport, total: calcCost(ctx, plan, km, days).총 };
   }));
 
   // 5) 응답
-  if(results.length===1){
-    return res.json({reply:
-      `🛫 ${from}→${to||"(행사의료지원)"} (${km}km/${hr||0}h)\n`+
-      `총 예상 비용: 약 ${results[0].total.toLocaleString()}원`
+  if (results.length === 1) {
+    return res.json({
+      reply:
+        `🛫 ${from}→${to || "(행사의료지원)"} (${km}km/${hr||0}h)\n` +
+        `총 예상 비용: 약 ${results[0].total.toLocaleString()}원`
     });
   } else {
-    const lines = results.map(r=>`- ${r.transport}: 약 ${r.total.toLocaleString()}원`).join("\n");
-    return res.json({reply:
-      `🛫 ${from}→${to||"(행사의료지원)"} (${km}km/${hr||0}h)\n비용 비교:\n${lines}`
+    const lines = results
+      .map(r => `- ${r.transport}: 약 ${r.total.toLocaleString()}원`)
+      .join("\n");
+    return res.json({
+      reply:
+        `🛫 ${from}→${to || "(행사의료지원)"} (${km}km/${hr||0}h)\n` +
+        `비용 비교:\n${lines}`
     });
   }
 });
 
-app.listen(3000,()=>console.log("🚀 KMTC AI 3000"));
+app.listen(3000, () => console.log("🚀 KMTC AI 3000"));
