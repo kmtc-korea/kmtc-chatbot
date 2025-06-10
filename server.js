@@ -19,8 +19,8 @@ config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /* ────── JSON 파일 수동 로드 ────── */
-const airportsInit = JSON.parse(fs.readFileSync(path.join(__dirname,"data/airports.json")));
-const countries    = JSON.parse(fs.readFileSync(path.join(__dirname,"data/countries.json")));
+const airportsInit = JSON.parse(fs.readFileSync(path.join(__dirname,"data/airports.json"), "utf8"));
+const countries    = JSON.parse(fs.readFileSync(path.join(__dirname,"data/countries.json"), "utf8"));
 
 config();
 const app = express();
