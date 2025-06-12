@@ -1,4 +1,4 @@
-// backend/server.js – KMTC AI 2025-06-12 (v13.2)
+// backend/server.js – KMTC AI 2025-06-12 (v13.5)
 // · GPT-4o type / cremated 판정
 // · 외부 업체 언급 금지
 // · Google Distance Matrix API만 사용
@@ -33,7 +33,8 @@ async function gptPlan(patient, km) {
     `진단:${patient.diagnosis||"unknown"} / 의식:${patient.consciousness||"unknown"}` +
     ` / 거동:${patient.mobility||"unknown"} / 거리:${km}`;
   const { choices:[{ message }] } = await openai.chat.completions.create({
-    model: "gpt-4o", temperature: 0.2,
+    model: "gpt-4o",
+    temperature: 0.2,
     messages: [
       { role: "system", content: sys },
       { role: "user",   content: usr }
@@ -49,14 +50,11 @@ async function routeInfo(fromAddr, toAddr) {
     `?origins=${encodeURIComponent(fromAddr)}` +
     `&destinations=${encodeURIComponent(toAddr)}` +
     `&key=${GMAPS_KEY}&language=ko`;
-
   const js = await fetch(url).then(r => r.json());
   const elem = js.rows?.[0]?.elements?.[0];
-
   if (!elem || elem.status !== "OK" || !elem.distance) {
     throw new Error(`거리 계산 실패: status=${elem?.status}`);
   }
-
   return {
     km:  Math.round(elem.distance.value / 1000),
     hr: +(elem.duration.value / 3600).toFixed(1)
@@ -67,29 +65,21 @@ async function routeInfo(fromAddr, toAddr) {
 function calcCost(ctx, plan, km, days) {
   let total = 0;
   const items = prices[ctx] || [];
-
-  items.forEach(item => {
+  for (const item of items) {
     const unit = item.단가;
     switch (item.계산방식) {
       case "단가x거리":
-        total += unit * km;
-        break;
+        total += unit * km; break;
       case "단가x거리x인원":
-        total += unit * km * (plan.staff.length || 1);
-        break;
+        total += unit * km * (plan.staff.length||1); break;
       case "단가x일수":
-        total += unit * days;
-        break;
+        total += unit * days; break;
       case "단가x일수x인원":
-        total += unit * days * (plan.staff.length || 1);
-        break;
+        total += unit * days * (plan.staff.length||1); break;
       case "단가":
-        total += unit;
-        break;
-      // 필요 시 다른 계산방식 추가
+        total += unit; break;
     }
-  });
-
+  }
   return total;
 }
 
@@ -103,7 +93,7 @@ const functions = [{
       intent:    { type: "string", enum: ["GENERAL","EXPLAIN_COST","CALCULATE_COST"] },
       from:      { type: "string" },
       to:        { type: "string" },
-      scenarios: { type: "array", items: { type: "string" } }
+      scenarios: { type: "array",  items: { type: "string" } }
     },
     required: ["intent"]
   }
@@ -120,7 +110,7 @@ app.post("/chat", async (req, res) => {
   const ses = sessions[sessionId] ||= {};
   if (Object.keys(patient).length) ses.patient = { ...ses.patient, ...patient };
 
-  // 1) intent 분류 시도 (auto function_call)
+  // 1) intent 분류 시도
   const cl = await openai.chat.completions.create({
     model: "gpt-4o", temperature: 0,
     messages: [
@@ -134,40 +124,38 @@ app.post("/chat", async (req, res) => {
 
   const choice = cl.choices[0].message;
 
-  // 2) function_call 없이 일반 메시지로 바로 왔으면 → 일반 챗 응답
+  // 2) 일반 메시지 → 일반 응답
   if (choice.content) {
     const chat = await openai.chat.completions.create({
       model: "gpt-4o", temperature: 0.7,
       messages: [
-        { role:"system", content:
-          "KMTC AI 상담원입니다. KMTC는 해외 환자 항공이송, 행사 의료지원, 방송 의료지원, 고인 이송 서비스를 제공합니다. 외부 업체 언급 금지." },
+        { role:"system", content: "KMTC AI 상담원입니다. 무엇을 도와드릴까요?" },
         { role:"user",   content: message }
       ]
     });
     return res.json({ reply: chat.choices[0].message.content.trim() });
   }
 
-  // 3) function_call이 온 경우 → 파라미터 파싱
-  const args     = JSON.parse(choice.function_call.arguments || "{}");
+  // 3) function_call → 파라미터 파싱
+  const args     = JSON.parse(choice.function_call.arguments||"{}");
   const intent   = args.intent;
   const from     = args.from;
   const to       = args.to;
-  const scenarios= args.scenarios || [];
+  const scenarios= args.scenarios||[];
 
   // 4) GENERAL
   if (intent === "GENERAL") {
     const chat = await openai.chat.completions.create({
       model: "gpt-4o", temperature: 0.7,
       messages: [
-        { role:"system", content:
-          "KMTC AI 상담원입니다. KMTC는 해외 환자 항공이송, 행사 의료지원, 방송 의료지원, 고인 이송 서비스를 제공합니다. 외부 업체 언급 금지." },
+        { role:"system", content: "KMTC AI 상담원입니다. KMTC 서비스를 소개합니다." },
         { role:"user",   content: message }
       ]
     });
     return res.json({ reply: chat.choices[0].message.content.trim() });
   }
 
-  // 5) 비용 구조 설명
+  // 5) EXPLAIN_COST
   if (intent === "EXPLAIN_COST") {
     const chat = await openai.chat.completions.create({
       model: "gpt-4o", temperature: 0.7,
@@ -179,34 +167,36 @@ app.post("/chat", async (req, res) => {
     return res.json({ reply: chat.choices[0].message.content.trim() });
   }
 
-  // 6) 실제 계산 (CALCULATE_COST)
+  // 6) CALCULATE_COST
   let km = 0, hr = 0;
-  if (from && to) {
-    try {
-      ({ km, hr } = await routeInfo(from, to));
-    } catch (e) {
-      return res.json({ reply: "⚠️ 거리 계산 실패. 주소를 다시 확인해주세요." });
+  const plan0 = await gptPlan(ses.patient||{}, 0);
+  const ctx   = plan0.type === "funeral" ? "고인이송"
+              : plan0.type === "event"   ? "행사의료지원"
+              :                             "항공이송";
+
+  // → 오직 항공이송/고인이송만 거리 계산
+  if (ctx === "항공이송" || ctx === "고인이송") {
+    if (!from || !to) {
+      return res.json({ reply: '📝 "…에서 …까지" 형식으로 출발지와 도착지를 알려주세요.' });
     }
+    try { ({ km, hr } = await routeInfo(from, to)); }
+    catch { return res.json({ reply: "⚠️ 거리 계산 실패. 주소를 다시 확인해주세요." }); }
   }
 
-  const plan0 = await gptPlan(ses.patient||{}, km);
-  const ctx   = plan0.type === "funeral" ? "고인이송"
-              : plan0.type === "event"   ? "행사지원"
-              :                             "항공이송";
+  // 7) 견적 계산
   const transports = scenarios.length ? scenarios : [plan0.transport];
-
   const results = transports.map(t => {
     const plan = { ...plan0, transport: t };
     if (ctx === "고인이송") plan.seat = "coffin";
     return calcCost(ctx, plan, km, days);
   });
 
-  // 7) 응답 생성
+  // 8) 응답 생성 (행사의료지원엔 거리가 표시되지 않음)
   if (results.length === 1) {
     return res.json({
       reply:
         `🚩 서비스: ${ctx}\n` +
-        (ctx !== "행사지원" ? `🚗 거리: ${km}km (${hr}h)\n` : "") +
+        (ctx !== "행사의료지원" ? `🚗 거리: ${km}km (${hr}h)\n` : "") +
         `💰 총 예상 비용: 약 ${results[0].toLocaleString()}원`
     });
   } else {
@@ -216,7 +206,7 @@ app.post("/chat", async (req, res) => {
     return res.json({
       reply:
         `🚩 서비스: ${ctx}\n` +
-        (ctx !== "행사지원" ? `🚗 거리: ${km}km (${hr}h)\n` : "") +
+        (ctx !== "행사의료지원" ? `🚗 거리: ${km}km (${hr}h)\n` : "") +
         `💸 비용 비교:\n${lines}`
     });
   }
