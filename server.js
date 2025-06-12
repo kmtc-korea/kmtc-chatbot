@@ -1,9 +1,10 @@
-// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode)
+// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Logging)
 // · Function Calling으로 주소 해석→거리 계산→비용 산출까지 자동 처리
 // · Google Geocoding + Distance Matrix API 사용
 // · data/structured_단가표.json에 있는 “단가”와 “계산방식”만 참조
 // · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
 // · 세션 동안 대화 이력 유지
+// · 모든 단계에서 에러를 잡아 터미널에 로깅하고, 사용자에겐 친절한 메시지 반환
 
 import express from "express";
 import cors from "cors";
@@ -26,95 +27,105 @@ const prices = JSON.parse(
 
 // ─── Google Geocoding API 호출 ─────────────────────────────────────────────
 async function geocodeAddress({ address }) {
-  const url = `https://maps.googleapis.com/maps/api/geocode/json` +
-    `?address=${encodeURIComponent(address)}` +
-    `&key=${GMAPS_KEY}`;
-  const js = await fetch(url).then(r => r.json());
-  if (js.status !== "OK" || !js.results?.length) {
-    throw new Error(`주소 해석 실패: ${js.status}`);
+  try {
+    const url = `https://maps.googleapis.com/maps/api/geocode/json` +
+      `?address=${encodeURIComponent(address)}` +
+      `&key=${GMAPS_KEY}`;
+    const js = await fetch(url).then(r => r.json());
+    if (js.status !== "OK" || !js.results?.length) {
+      throw new Error(`status=${js.status}`);
+    }
+    const loc = js.results[0].geometry.location;
+    return { lat: loc.lat, lng: loc.lng };
+  } catch (err) {
+    console.error("🛑 geocodeAddress error:", err);
+    throw new Error(`주소 해석 실패: ${err.message}`);
   }
-  const loc = js.results[0].geometry.location;
-  return { lat: loc.lat, lng: loc.lng };
 }
 
 // ─── Google Distance Matrix API 호출 ────────────────────────────────────────
 async function getDistance({ origin, destination }) {
-  // origin/destination 은 "lat,lng" 형식의 문자열
-  const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
-    `?origins=${origin}` +
-    `&destinations=${destination}` +
-    `&key=${GMAPS_KEY}&language=ko`;
-  const js = await fetch(url).then(r => r.json());
-  const elem = js.rows?.[0]?.elements?.[0];
-  if (!elem || elem.status !== "OK" || !elem.distance) {
-    throw new Error(`거리 계산 실패: status=${elem?.status}`);
+  try {
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
+      `?origins=${origin}` +
+      `&destinations=${destination}` +
+      `&key=${GMAPS_KEY}&language=ko`;
+    const js = await fetch(url).then(r => r.json());
+    const elem = js.rows?.[0]?.elements?.[0];
+    if (!elem || elem.status !== "OK" || !elem.distance) {
+      throw new Error(`status=${elem?.status}`);
+    }
+    return {
+      km: Math.round(elem.distance.value / 1000),
+      hr: +(elem.duration.value / 3600).toFixed(1)
+    };
+  } catch (err) {
+    console.error("🛑 getDistance error:", err);
+    throw new Error(`거리 계산 실패: ${err.message}`);
   }
-  return {
-    km: Math.round(elem.distance.value / 1000),
-    hr: +(elem.duration.value / 3600).toFixed(1)
-  };
 }
 
 // ─── 비용 계산 ───────────────────────────────────────────────────────────────
 async function computeCost({ context, transport, km, days, patient }) {
-  const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-  // AI 플랜 생성 (JSON ONLY)
-  const planRes = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0.2,
-    messages: [
-      {
-        role: "system",
-        content: `JSON ONLY:
-{"type":"air|funeral|event","cremated":bool,"risk":"low|medium|high","transport":"civil|airAmbulance|charter|ship","seat":"business|stretcher","staff":["doctor","nurse"],"equipment":{"ventilator":bool,"ecmo":bool},"medLvl":"low|medium|high","notes":["..."]}`
-      },
-      {
-        role: "user",
-        content:
-          `진단:${patient.diagnosis||"unknown"} / 의식:${patient.consciousness||"unknown"}` +
-          ` / 거동:${patient.mobility||"unknown"} / 거리:${km}`
-      }
-    ]
-  });
-  let plan0;
   try {
-    plan0 = JSON.parse(planRes.choices[0].message.content.trim());
-  } catch {
-    // 파싱 실패 시 기본 플랜
-    plan0 = {
-      type: "air",
-      cremated: false,
-      risk: "medium",
-      transport,
-      seat: "business",
-      staff: ["doctor","nurse"],
-      equipment: { ventilator:true, ecmo:false },
-      medLvl: "medium",
-      notes: []
-    };
-  }
-  // 실제 비용 계산
-  const ctxKey =
-    plan0.type === "funeral" ? "고인이송"
-    : plan0.type === "event"   ? "행사지원"
-    :                           "항공이송";
-  let total = 0;
-  (prices[ctxKey] || []).forEach(item => {
-    const u = item.단가;
-    switch (item.계산방식) {
-      case "단가x거리":
-        total += u * km; break;
-      case "단가x거리x인원":
-        total += u * km * (plan0.staff.length||1); break;
-      case "단가x일수":
-        total += u * days; break;
-      case "단가x일수x인원":
-        total += u * days * (plan0.staff.length||1); break;
-      case "단가":
-        total += u; break;
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+    // 1) AI 플랜 생성 (JSON ONLY)
+    const planRes = await openai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: `JSON ONLY:
+{"type":"air|funeral|event","cremated":bool,"risk":"low|medium|high","transport":"civil|airAmbulance|charter|ship","seat":"business|stretcher","staff":["doctor","nurse"],"equipment":{"ventilator":bool,"ecmo":bool},"medLvl":"low|medium|high","notes":["..."]}`
+        },
+        {
+          role: "user",
+          content:
+            `진단:${patient.diagnosis||"unknown"} / 의식:${patient.consciousness||"unknown"}` +
+            ` / 거동:${patient.mobility||"unknown"} / 거리:${km}`
+        }
+      ]
+    });
+    let plan0;
+    try {
+      plan0 = JSON.parse(planRes.choices[0].message.content.trim());
+    } catch (err) {
+      console.error("🛑 plan JSON parse error:", err);
+      plan0 = {
+        type: "air", cremated: false, risk: "medium",
+        transport, seat: "business",
+        staff: ["doctor","nurse"],
+        equipment: { ventilator:true, ecmo:false },
+        medLvl: "medium", notes: []
+      };
     }
-  });
-  return { plan: plan0, context: ctxKey, km, days, total };
+    // 2) 실제 비용 계산
+    const ctxKey =
+      plan0.type === "funeral" ? "고인이송"
+      : plan0.type === "event"   ? "행사지원"
+      :                            "항공이송";
+    let total = 0;
+    (prices[ctxKey] || []).forEach(item => {
+      const u = item.단가;
+      switch (item.계산방식) {
+        case "단가x거리":
+          total += u * km; break;
+        case "단가x거리x인원":
+          total += u * km * (plan0.staff.length||1); break;
+        case "단가x일수":
+          total += u * days; break;
+        case "단가x일수x인원":
+          total += u * days * (plan0.staff.length||1); break;
+        case "단가":
+          total += u; break;
+      }
+    });
+    return { plan: plan0, context: ctxKey, km, days, total };
+  } catch (err) {
+    console.error("🛑 computeCost error:", err);
+    throw new Error("비용 산출 중 오류가 발생했습니다.");
+  }
 }
 
 // ─── Function Calling 정의 ─────────────────────────────────────────────────
@@ -167,11 +178,12 @@ app.use(express.json());
 const sessions = {};
 
 app.post("/chat", async (req, res) => {
-  const { sessionId="def", message="", days=1, patient={} } = req.body;
-  const ses = sessions[sessionId] ||= {
-    history: [{
-      role: "system",
-      content: `
+  try {
+    const { sessionId="def", message="", days=1, patient={} } = req.body;
+    const ses = sessions[sessionId] ||= {
+      history: [{
+        role: "system",
+        content: `
 당신은 KMTC AI 상담원입니다.
 - 서비스: 항공이송, 고인이송, 행사 의료지원
 - 주소 변환: Google Geocoding API
@@ -179,102 +191,99 @@ app.post("/chat", async (req, res) => {
 - 비용 계산: data/structured_단가표.json 참조
 - 응답은 마크다운, 공감·애도 표현 포함
 - 타업체 언급 금지`
-    }]
-  };
+      }]
+    };
 
-  // 사용자 메시지 추가
-  ses.history.push({ role: "user", content: message });
+    // 사용자 메시지 추가
+    ses.history.push({ role: "user", content: message });
 
-  // 1) AI에 처음 요청 (Function Calling)
-  const first = await new OpenAI({ apiKey: OPENAI_API_KEY }).chat.completions.create({
-    model: "gpt-4o",
-    messages: ses.history,
-    functions,
-    function_call: "auto"
-  });
-  const msg = first.choices[0].message;
-  ses.history.push(msg);
+    // 1) AI에 처음 요청 (Function Calling)
+    const first = await new OpenAI({ apiKey: OPENAI_API_KEY })
+      .chat.completions.create({
+        model: "gpt-4o",
+        messages: ses.history,
+        functions,
+        function_call: "auto"
+      });
+    const msg = first.choices[0].message;
+    ses.history.push(msg);
 
-  // 2) geocodeAddress 호출 필요 시
-  if (msg.function_call?.name === "geocodeAddress") {
-    const { address } = JSON.parse(msg.function_call.arguments);
-    let loc;
-    try {
-      loc = await geocodeAddress({ address });
-    } catch {
-      return res.json({ reply: "⚠️ 주소 해석 실패. 다시 입력해주세요." });
+    // 2) geocodeAddress
+    if (msg.function_call?.name === "geocodeAddress") {
+      const { address } = JSON.parse(msg.function_call.arguments);
+      let loc = await geocodeAddress({ address });
+      ses.history.push({
+        role: "function", name: "geocodeAddress",
+        content: JSON.stringify(loc)
+      });
+      return invokeNext();
     }
-    ses.history.push({
-      role: "function",
-      name: "geocodeAddress",
-      content: JSON.stringify(loc)
-    });
-    return invokeNext();
-  }
 
-  // 3) getDistance 호출 필요 시
-  if (msg.function_call?.name === "getDistance") {
-    const { origin, destination } = JSON.parse(msg.function_call.arguments);
-    let dist;
-    try {
-      dist = await getDistance({ origin, destination });
-    } catch {
-      return res.json({ reply: "⚠️ 거리 계산 실패. 주소를 다시 확인해주세요." });
+    // 3) getDistance
+    if (msg.function_call?.name === "getDistance") {
+      const { origin, destination } = JSON.parse(msg.function_call.arguments);
+      let dist = await getDistance({ origin, destination });
+      ses.history.push({
+        role: "function", name: "getDistance",
+        content: JSON.stringify(dist)
+      });
+      return invokeNext();
     }
-    ses.history.push({
-      role: "function",
-      name: "getDistance",
-      content: JSON.stringify(dist)
-    });
-    return invokeNext();
-  }
 
-  // 4) computeCost 호출 필요 시
-  if (msg.function_call?.name === "computeCost") {
-    return completeCost(msg);
-  }
-
-  // 5) 일반 대화 응답
-  return res.json({ reply: msg.content });
-
-  // 헬퍼: geocode/getDistance 후 다음 단계 호출
-  async function invokeNext() {
-    const next = await new OpenAI({ apiKey: OPENAI_API_KEY }).chat.completions.create({
-      model: "gpt-4o",
-      messages: ses.history,
-      functions,
-      function_call: "auto"
-    });
-    const m2 = next.choices[0].message;
-    ses.history.push(m2);
-    if (m2.function_call?.name === "computeCost") {
-      return completeCost(m2);
+    // 4) computeCost
+    if (msg.function_call?.name === "computeCost") {
+      return completeCost(msg);
     }
-    return res.json({ reply: m2.content });
-  }
 
-  // 헬퍼: computeCost 실행 후 최종 마크다운 응답
-  async function completeCost(fnMsg) {
-    const args = JSON.parse(fnMsg.function_call.arguments);
-    const costRes = await computeCost({
-      context: args.context,
-      transport: args.transport,
-      km: args.km,
-      days,
-      patient
+    // 5) 일반 대화 응답
+    return res.json({ reply: msg.content });
+
+    // 헬퍼: geocode → distance → cost 흐름 유도
+    async function invokeNext() {
+      const next = await new OpenAI({ apiKey: OPENAI_API_KEY })
+        .chat.completions.create({
+          model: "gpt-4o",
+          messages: ses.history,
+          functions,
+          function_call: "auto"
+        });
+      const m2 = next.choices[0].message;
+      ses.history.push(m2);
+      if (m2.function_call?.name === "computeCost") {
+        return completeCost(m2);
+      }
+      return res.json({ reply: m2.content });
+    }
+
+    // 헬퍼: 최종 비용 산출 및 렌더링
+    async function completeCost(fnMsg) {
+      const args    = JSON.parse(fnMsg.function_call.arguments);
+      const costRes = await computeCost({
+        context:   args.context,
+        transport: args.transport,
+        km:        args.km,
+        days,
+        patient
+      });
+      ses.history.push({
+        role: "function", name: "computeCost",
+        content: JSON.stringify(costRes)
+      });
+      const fin = await new OpenAI({ apiKey: OPENAI_API_KEY })
+        .chat.completions.create({
+          model: "gpt-4o",
+          messages: ses.history
+        });
+      const finalReply = fin.choices[0].message.content;
+      ses.history.push({ role: "assistant", content: finalReply });
+      return res.json({ reply: finalReply });
+    }
+
+  } catch (err) {
+    console.error("🛑 /chat error:", err);
+    return res.json({
+      reply: "⚠️ 서버 내부에서 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
     });
-    ses.history.push({
-      role: "function",
-      name: "computeCost",
-      content: JSON.stringify(costRes)
-    });
-    const fin = await new OpenAI({ apiKey: OPENAI_API_KEY }).chat.completions.create({
-      model: "gpt-4o",
-      messages: ses.history
-    });
-    const finalReply = fin.choices[0].message.content;
-    ses.history.push({ role: "assistant", content: finalReply });
-    return res.json({ reply: finalReply });
   }
 });
 
