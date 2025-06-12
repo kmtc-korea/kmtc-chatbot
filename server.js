@@ -1,10 +1,9 @@
-// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Logging)
+// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Fallback)
 // · Function Calling으로 주소 해석→거리 계산→비용 산출까지 자동 처리
-// · Google Geocoding + Distance Matrix API 사용
+// · Google Geocoding + Distance Matrix API 사용, 실패 시 Haversine 법으로 대체
 // · data/structured_단가표.json에 있는 “단가”와 “계산방식”만 참조
 // · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
-// · 세션 동안 대화 이력 유지
-// · 모든 단계에서 에러를 잡아 터미널에 로깅하고, 사용자에겐 친절한 메시지 반환
+// · 세션 동안 대화 이력 유지, 모든 단계 에러 로깅
 
 import express from "express";
 import cors from "cors";
@@ -25,6 +24,18 @@ const prices = JSON.parse(
   fs.readFileSync(path.join(__dirname, "data/structured_단가표.json"), "utf8")
 );
 
+// ─── Haversine 공식 (직선 거리 계산) ─────────────────────────────────────────
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat/2)**2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return 6371 * c; // 지구 반지름 6371km
+}
+
 // ─── Google Geocoding API 호출 ─────────────────────────────────────────────
 async function geocodeAddress({ address }) {
   try {
@@ -43,8 +54,9 @@ async function geocodeAddress({ address }) {
   }
 }
 
-// ─── Google Distance Matrix API 호출 ────────────────────────────────────────
+// ─── Google Distance Matrix 또는 Haversine Fallback ────────────────────────
 async function getDistance({ origin, destination }) {
+  // origin/destination 은 "lat,lng" 문자열
   try {
     const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
       `?origins=${origin}` +
@@ -52,16 +64,25 @@ async function getDistance({ origin, destination }) {
       `&key=${GMAPS_KEY}&language=ko`;
     const js = await fetch(url).then(r => r.json());
     const elem = js.rows?.[0]?.elements?.[0];
-    if (!elem || elem.status !== "OK" || !elem.distance) {
-      throw new Error(`status=${elem?.status}`);
+    if (elem?.status === "OK" && elem.distance) {
+      return {
+        km: Math.round(elem.distance.value / 1000),
+        hr: +(elem.duration.value / 3600).toFixed(1)
+      };
     }
-    return {
-      km: Math.round(elem.distance.value / 1000),
-      hr: +(elem.duration.value / 3600).toFixed(1)
-    };
+    // ZERO_RESULTS 등 일괄 처리 → Haversine
+    throw new Error(`status=${elem?.status}`);
   } catch (err) {
-    console.error("🛑 getDistance error:", err);
-    throw new Error(`거리 계산 실패: ${err.message}`);
+    console.warn("⚠️ Distance Matrix failed, using Haversine:", err.message);
+    // lat,lng 파싱
+    const [olat, olon] = origin.split(",").map(Number);
+    const [dlat, dlon] = destination.split(",").map(Number);
+    const km = haversineDistance(olat, olon, dlat, dlon);
+    const avgSpeedKmh = 500; // 평균 비행속도 (km/h)
+    return {
+      km: Math.round(km),
+      hr: +(km / avgSpeedKmh).toFixed(1)
+    };
   }
 }
 
@@ -69,7 +90,7 @@ async function getDistance({ origin, destination }) {
 async function computeCost({ context, transport, km, days, patient }) {
   try {
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    // 1) AI 플랜 생성 (JSON ONLY)
+    // AI 플랜 생성 (JSON ONLY)
     const planRes = await openai.chat.completions.create({
       model: "gpt-4o",
       temperature: 0.2,
@@ -90,8 +111,8 @@ async function computeCost({ context, transport, km, days, patient }) {
     let plan0;
     try {
       plan0 = JSON.parse(planRes.choices[0].message.content.trim());
-    } catch (err) {
-      console.error("🛑 plan JSON parse error:", err);
+    } catch (parseErr) {
+      console.error("🛑 plan JSON parse error:", parseErr);
       plan0 = {
         type: "air", cremated: false, risk: "medium",
         transport, seat: "business",
@@ -100,7 +121,6 @@ async function computeCost({ context, transport, km, days, patient }) {
         medLvl: "medium", notes: []
       };
     }
-    // 2) 실제 비용 계산
     const ctxKey =
       plan0.type === "funeral" ? "고인이송"
       : plan0.type === "event"   ? "행사지원"
@@ -109,16 +129,11 @@ async function computeCost({ context, transport, km, days, patient }) {
     (prices[ctxKey] || []).forEach(item => {
       const u = item.단가;
       switch (item.계산방식) {
-        case "단가x거리":
-          total += u * km; break;
-        case "단가x거리x인원":
-          total += u * km * (plan0.staff.length||1); break;
-        case "단가x일수":
-          total += u * days; break;
-        case "단가x일수x인원":
-          total += u * days * (plan0.staff.length||1); break;
-        case "단가":
-          total += u; break;
+        case "단가x거리": total += u * km; break;
+        case "단가x거리x인원": total += u * km * (plan0.staff.length||1); break;
+        case "단가x일수": total += u * days; break;
+        case "단가x일수x인원": total += u * days * (plan0.staff.length||1); break;
+        case "단가": total += u; break;
       }
     });
     return { plan: plan0, context: ctxKey, km, days, total };
@@ -187,7 +202,7 @@ app.post("/chat", async (req, res) => {
 당신은 KMTC AI 상담원입니다.
 - 서비스: 항공이송, 고인이송, 행사 의료지원
 - 주소 변환: Google Geocoding API
-- 거리 계산: Google Distance Matrix API
+- 거리 계산: Google Distance Matrix → Haversine Fallback
 - 비용 계산: data/structured_단가표.json 참조
 - 응답은 마크다운, 공감·애도 표현 포함
 - 타업체 언급 금지`
@@ -197,7 +212,7 @@ app.post("/chat", async (req, res) => {
     // 사용자 메시지 추가
     ses.history.push({ role: "user", content: message });
 
-    // 1) AI에 처음 요청 (Function Calling)
+    // 1) AI 첫 호출 (Function Calling)
     const first = await new OpenAI({ apiKey: OPENAI_API_KEY })
       .chat.completions.create({
         model: "gpt-4o",
@@ -208,37 +223,39 @@ app.post("/chat", async (req, res) => {
     const msg = first.choices[0].message;
     ses.history.push(msg);
 
-    // 2) geocodeAddress
+    // 2) geocodeAddress 필요
     if (msg.function_call?.name === "geocodeAddress") {
       const { address } = JSON.parse(msg.function_call.arguments);
-      let loc = await geocodeAddress({ address });
+      const loc = await geocodeAddress({ address });
       ses.history.push({
-        role: "function", name: "geocodeAddress",
+        role: "function",
+        name: "geocodeAddress",
         content: JSON.stringify(loc)
       });
       return invokeNext();
     }
 
-    // 3) getDistance
+    // 3) getDistance 필요
     if (msg.function_call?.name === "getDistance") {
       const { origin, destination } = JSON.parse(msg.function_call.arguments);
-      let dist = await getDistance({ origin, destination });
+      const dist = await getDistance({ origin, destination });
       ses.history.push({
-        role: "function", name: "getDistance",
+        role: "function",
+        name: "getDistance",
         content: JSON.stringify(dist)
       });
       return invokeNext();
     }
 
-    // 4) computeCost
+    // 4) computeCost 필요
     if (msg.function_call?.name === "computeCost") {
       return completeCost(msg);
     }
 
-    // 5) 일반 대화 응답
+    // 5) 일반 응답
     return res.json({ reply: msg.content });
 
-    // 헬퍼: geocode → distance → cost 흐름 유도
+    // Helper: geocode/getDistance → 다음 호출
     async function invokeNext() {
       const next = await new OpenAI({ apiKey: OPENAI_API_KEY })
         .chat.completions.create({
@@ -255,7 +272,7 @@ app.post("/chat", async (req, res) => {
       return res.json({ reply: m2.content });
     }
 
-    // 헬퍼: 최종 비용 산출 및 렌더링
+    // Helper: computeCost → 최종 출력
     async function completeCost(fnMsg) {
       const args    = JSON.parse(fnMsg.function_call.arguments);
       const costRes = await computeCost({
@@ -266,7 +283,8 @@ app.post("/chat", async (req, res) => {
         patient
       });
       ses.history.push({
-        role: "function", name: "computeCost",
+        role: "function",
+        name: "computeCost",
         content: JSON.stringify(costRes)
       });
       const fin = await new OpenAI({ apiKey: OPENAI_API_KEY })
