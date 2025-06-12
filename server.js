@@ -1,4 +1,4 @@
-// backend/server.js – KMTC AI 2025-06-12 (v14.3)
+// backend/server.js – KMTC AI 2025-06-12 (v14.4)
 // · GPT-4o type / cremated 판정
 // · 외부 업체 언급 금지
 // · Google Distance Matrix API만 사용
@@ -6,6 +6,7 @@
 // · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
 // · 세션이 살아있는 동안 대화 이력 유지
 // · 마지막에 예측 견적 안내 문구 추가 (항공이송·고인이송)
+// · 환자 진단명만으로 AI가 자동으로 인력·장비 구성 후 견적 산출
 
 import express from "express";
 import cors from "cors";
@@ -35,12 +36,9 @@ async function routeInfo(fromAddr, toAddr) {
     `?origins=${encodeURIComponent(fromAddr)}` +
     `&destinations=${encodeURIComponent(toAddr)}` +
     `&key=${GMAPS_KEY}&language=ko`;
-  console.log("[DEBUG] DistanceMatrix 요청 URL:", url);
   const js = await fetch(url).then(r => r.json());
-  console.log("[DEBUG] DistanceMatrix 응답:", js);
   const elem = js.rows?.[0]?.elements?.[0];
   if (!elem || elem.status !== "OK" || !elem.distance) {
-    console.error("[ERROR] 거리 계산 실패:", elem?.status, js.error_message);
     throw new Error(`거리 계산 실패: status=${elem?.status}`);
   }
   return {
@@ -49,21 +47,24 @@ async function routeInfo(fromAddr, toAddr) {
   };
 }
 
-// ─── 간결한 system prompt ──────────────────────────────────────────────────
+// ─── system prompt (업데이트) ───────────────────────────────────────────────
 const systemPrompt = `
 당신은 KMTC AI 상담원입니다.
-- 제공 서비스: 항공이송, 고인이송, 행사 의료지원
+- 서비스: 항공이송, 고인이송, 행사 의료지원
 - 견적 계산 시 data/structured_단가표.json만 참고
 - 항공이송·고인이송: Google Distance Matrix API로 km/hr 계산
 - 행사 의료지원: 거리 무시
 - 응답은 마크다운으로 간결하게
+- **진단 기반 자동 구성**:
+  - 사용자에게 인력·장비를 묻지 않고, 제공된 진단명(예: 뇌경색)을 바탕으로
+    AI가 필요한 staff(의사/간호사/응급구조사 수)와 equipment(ventilator, ECMO 등)
+    을 스스로 판단해 견적에 반영하십시오.
 - **공감·애도 표현 필수**:
   - 고인이송: "삼가 고인의 명복을 빕니다." 등 애도 문구
   - 환자 이송: "환자분의 상황이 많이 힘드셨을 텐데…" 등 공감 문구
 - **절대** 타업체 언급 금지
 `;
 
-// ─── Express 설정 ───────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -83,7 +84,7 @@ app.post("/chat", async (req, res) => {
     history: [{ role: "system", content: systemPrompt }]
   };
 
-  // 1) 항공이송/고인이송일 때만 거리 계산
+  // 거리 계산 (항공이송·고인이송만)
   let km = 0, hr = 0;
   if (/항공이송|고인이송/.test(message)) {
     const m = message.match(/(.+)에서 (.+)까지/);
@@ -97,15 +98,15 @@ app.post("/chat", async (req, res) => {
           content: `거리: ${km}km, 소요시간: ${hr}h`
         });
       } catch {
-        // 거리 계산 실패해도 이어서 진행
+        // 실패 시 무시
       }
     }
   }
 
-  // 2) 사용자 메시지 히스토리에 추가
+  // 사용자 메시지 추가
   ses.history.push({ role: "user", content: message });
 
-  // 3) ChatCompletion 호출
+  // ChatCompletion
   const chat = await openai.chat.completions.create({
     model: "gpt-4o",
     temperature: 0.2,
@@ -113,17 +114,17 @@ app.post("/chat", async (req, res) => {
   });
   let reply = chat.choices[0].message.content.trim();
 
-  // 4) 예측 견적 안내 문구 추가 (항공이송·고인이송일 경우)
+  // 예측 견적 안내 문구 (항공이송·고인이송)
   if (/항공이송|고인이송/.test(message)) {
     reply += `
 
 *이 견적은 예측 견적이며, 정확한 견적은 환자의 소견서 및 국제 유가, 항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*`;
   }
 
-  // 5) 어시스턴트 답변 히스토리에 추가
+  // 히스토리 저장
   ses.history.push({ role: "assistant", content: reply });
 
-  // 6) 클라이언트에 응답
+  // 응답
   res.json({ reply });
 });
 
