@@ -1,17 +1,18 @@
-// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Fallback)
+// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Fallback+TransportCategories)
 // · Function Calling으로 주소 해석→거리 계산→비용 산출까지 자동 처리
 // · Google Geocoding + Distance Matrix API 사용, 실패 시 Haversine 법으로 대체
 // · data/structured_단가표.json에 있는 “단가”와 “계산방식”만 참조
+// · 이송 종류: 민항기, 국적기, 에어앰블런스, 전용기, 선박
 // · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
 // · 세션 동안 대화 이력 유지, 모든 단계 에러 로깅
 
 import express from "express";
-import cors from "cors";
+import cors   from "cors";
 import { config } from "dotenv";
-import fetch from "node-fetch";
+import fetch  from "node-fetch";
 import { OpenAI } from "openai";
-import fs from "fs";
-import path from "path";
+import fs     from "fs";
+import path   from "path";
 import { fileURLToPath } from "url";
 
 config();
@@ -26,7 +27,7 @@ const prices = JSON.parse(
 
 // ─── Haversine 공식 (직선 거리 계산) ─────────────────────────────────────────
 function haversineDistance(lat1, lon1, lat2, lon2) {
-  const toRad = (v) => (v * Math.PI) / 180;
+  const toRad = v => (v * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -56,7 +57,6 @@ async function geocodeAddress({ address }) {
 
 // ─── Google Distance Matrix 또는 Haversine Fallback ────────────────────────
 async function getDistance({ origin, destination }) {
-  // origin/destination 은 "lat,lng" 문자열
   try {
     const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
       `?origins=${origin}` +
@@ -70,15 +70,13 @@ async function getDistance({ origin, destination }) {
         hr: +(elem.duration.value / 3600).toFixed(1)
       };
     }
-    // ZERO_RESULTS 등 일괄 처리 → Haversine
     throw new Error(`status=${elem?.status}`);
   } catch (err) {
     console.warn("⚠️ Distance Matrix failed, using Haversine:", err.message);
-    // lat,lng 파싱
     const [olat, olon] = origin.split(",").map(Number);
     const [dlat, dlon] = destination.split(",").map(Number);
     const km = haversineDistance(olat, olon, dlat, dlon);
-    const avgSpeedKmh = 500; // 평균 비행속도 (km/h)
+    const avgSpeedKmh = 500; // km/h
     return {
       km: Math.round(km),
       hr: +(km / avgSpeedKmh).toFixed(1)
@@ -185,6 +183,15 @@ const functions = [
   }
 ];
 
+// ─── 이송 종류 라벨 맵핑 ────────────────────────────────────────────────────
+const transportLabels = {
+  civil:         "민항기 (상업용 여객기)",
+  national:      "국적기 (대한항공·아시아나 등)",
+  airAmbulance:  "에어앰블런스",
+  charter:       "전용기 (임차 전용기)",
+  ship:          "선박"
+};
+
 // ─── Express 서버 설정 ───────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
@@ -202,17 +209,19 @@ app.post("/chat", async (req, res) => {
 당신은 KMTC AI 상담원입니다.
 - 서비스: 항공이송, 고인이송, 행사 의료지원
 - 주소 변환: Google Geocoding API
-- 거리 계산: Google Distance Matrix → Haversine Fallback
+- 거리 계산: Distance Matrix → Haversine Fallback
 - 비용 계산: data/structured_단가표.json 참조
+- 이송 종류 구분: 민항기, 국적기, 에어앰블런스, 전용기, 선박
 - 응답은 마크다운, 공감·애도 표현 포함
-- 타업체 언급 금지`
+- 타업체 언급 금지
+        `.trim()
       }]
     };
 
-    // 사용자 메시지 추가
+    // 1) 사용자 메시지 히스토리에 추가
     ses.history.push({ role: "user", content: message });
 
-    // 1) AI 첫 호출 (Function Calling)
+    // 2) Function Calling 첫 요청
     const first = await new OpenAI({ apiKey: OPENAI_API_KEY })
       .chat.completions.create({
         model: "gpt-4o",
@@ -223,7 +232,7 @@ app.post("/chat", async (req, res) => {
     const msg = first.choices[0].message;
     ses.history.push(msg);
 
-    // 2) geocodeAddress 필요
+    // 3) 주소 → 위경도
     if (msg.function_call?.name === "geocodeAddress") {
       const { address } = JSON.parse(msg.function_call.arguments);
       const loc = await geocodeAddress({ address });
@@ -235,7 +244,7 @@ app.post("/chat", async (req, res) => {
       return invokeNext();
     }
 
-    // 3) getDistance 필요
+    // 4) 위경도 → 거리/시간
     if (msg.function_call?.name === "getDistance") {
       const { origin, destination } = JSON.parse(msg.function_call.arguments);
       const dist = await getDistance({ origin, destination });
@@ -247,15 +256,15 @@ app.post("/chat", async (req, res) => {
       return invokeNext();
     }
 
-    // 4) computeCost 필요
+    // 5) 비용 산출
     if (msg.function_call?.name === "computeCost") {
       return completeCost(msg);
     }
 
-    // 5) 일반 응답
+    // 6) 일반 대화 응답
     return res.json({ reply: msg.content });
 
-    // Helper: geocode/getDistance → 다음 호출
+    // ── 헬퍼: geocode/getDistance 후 다시 AI에게 넘기기
     async function invokeNext() {
       const next = await new OpenAI({ apiKey: OPENAI_API_KEY })
         .chat.completions.create({
@@ -272,7 +281,7 @@ app.post("/chat", async (req, res) => {
       return res.json({ reply: m2.content });
     }
 
-    // Helper: computeCost → 최종 출력
+    // ── 헬퍼: computeCost 실행 후 최종 마크다운 직접 렌더링
     async function completeCost(fnMsg) {
       const args    = JSON.parse(fnMsg.function_call.arguments);
       const costRes = await computeCost({
@@ -287,14 +296,37 @@ app.post("/chat", async (req, res) => {
         name: "computeCost",
         content: JSON.stringify(costRes)
       });
-      const fin = await new OpenAI({ apiKey: OPENAI_API_KEY })
-        .chat.completions.create({
-          model: "gpt-4o",
-          messages: ses.history
-        });
-      const finalReply = fin.choices[0].message.content;
-      ses.history.push({ role: "assistant", content: finalReply });
-      return res.json({ reply: finalReply });
+
+      // 직접 마크다운 조립
+      const { plan, context, km, days: d, total, transport } = costRes;
+      let reply = "";
+
+      // 공감·애도
+      if (context === "고인이송") {
+        reply += "**삼가 고인의 명복을 빕니다.**\n\n";
+      } else if (context === "항공이송") {
+        reply += "환자분의 상황이 많이 힘드셨을 텐데… 빠른 쾌유를 기원합니다.\n\n";
+      }
+
+      // 이송 종류
+      reply += "**이송 종류**\n";
+      Object.entries(transportLabels).forEach(([key,label]) => {
+        reply += (key === transport ? "▶ " : "• ") + label + "\n";
+      });
+      reply += "\n";
+
+      // 상세 견적
+      reply += `### ${context} 견적 정보\n\n`;
+      reply += `- 거리/시간: ${km.toLocaleString()} km / ${costRes.hr} h\n`;
+      reply += `- 진단명: ${patient.diagnosis || "알 수 없음"}\n`;
+      reply += `- 필요 인력: ${plan.staff.join(", ")}\n`;
+      reply += `- 장비: ${Object.entries(plan.equipment).filter(([,v])=>v).map(([k])=>k).join(", ")||"없음"}\n\n`;
+      reply += `### 예상 비용\n\n`;
+      reply += `- ${transportLabels[transport]}: **${total.toLocaleString()}원**\n\n`;
+      reply += `*이 견적은 예측 견적이며, 환자 상태·국제 유가·항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*\n`;
+
+      ses.history.push({ role: "assistant", content: reply });
+      return res.json({ reply });
     }
 
   } catch (err) {
