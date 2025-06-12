@@ -1,10 +1,11 @@
-// backend/server.js – KMTC AI 2025-06-12 (v14.2)
+// backend/server.js – KMTC AI 2025-06-12 (v14.3)
 // · GPT-4o type / cremated 판정
 // · 외부 업체 언급 금지
 // · Google Distance Matrix API만 사용
 // · data/structured_단가표.json 에 있는 “단가”와 “계산방식”만 참조
 // · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
 // · 세션이 살아있는 동안 대화 이력 유지
+// · 마지막에 예측 견적 안내 문구 추가 (항공이송·고인이송)
 
 import express from "express";
 import cors from "cors";
@@ -107,12 +108,19 @@ app.post("/chat", async (req, res) => {
     temperature: 0.2,
     messages: ses.history
   });
-  const reply = chat.choices[0].message.content.trim();
+  let reply = chat.choices[0].message.content.trim();
 
-  // 4) 어시스턴트 답변 히스토리에 추가
+  // 4) 예측 견적 안내 문구 추가 (항공이송·고인이송일 경우)
+  if (/항공이송|고인이송/.test(message)) {
+    reply += `
+
+*이 견적은 예측 견적이며, 정확한 견적은 환자의 소견서 및 국제 유가, 항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*`;
+  }
+
+  // 5) 어시스턴트 답변 히스토리에 추가
   ses.history.push({ role: "assistant", content: reply });
 
-  // 5) 클라이언트에 응답
+  // 6) 클라이언트에 응답
   res.json({ reply });
 });
 
