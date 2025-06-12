@@ -99,7 +99,7 @@ async function computeCost({ context, transport, km, days, patient }) {
     }
   });
 
-  return { plan: plan0, context: ctxKey, km, hr:0, total };
+  return { plan: plan0, context: ctxKey, km, days, total };
 }
 
 // ─── Function Calling 정의 ─────────────────────────────────────────────────
@@ -155,8 +155,10 @@ app.post("/chat", async (req, res) => {
     }]
   };
 
-  // 1) AI에게 의도 분석+함수 호출 요청
+  // 1) 사용자 입력을 히스토리에 추가
   ses.history.push({ role:"user", content: message });
+
+  // 2) AI에게 의도 분석 + Function 호출 요청
   const first = await new OpenAI({ apiKey: OPENAI_API_KEY })
     .chat.completions.create({
       model: "gpt-4o",
@@ -164,11 +166,10 @@ app.post("/chat", async (req, res) => {
       functions,
       function_call: "auto"
     });
-
   const msg = first.choices[0].message;
   ses.history.push(msg);
 
-  // 2) getDistance 호출 필요 시 실제 실행
+  // 3) getDistance 호출 필요 시
   if (msg.function_call?.name === "getDistance") {
     const args = JSON.parse(msg.function_call.arguments);
     let dist;
@@ -179,52 +180,53 @@ app.post("/chat", async (req, res) => {
       ses.history.push({ role:"assistant", content: warn });
       return res.json({ reply: warn });
     }
-    // 호출 결과를 AI에게 다시 전달
+    // Function 결과를 히스토리에 추가
     ses.history.push({
       role: "function",
       name: "getDistance",
       content: JSON.stringify(dist)
     });
-    const second = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: ses.history,
-      functions,
-      function_call: "auto"
-    });
+    // 다시 AI에 넘겨서 computeCost 호출 유도
+    const second = await new OpenAI({ apiKey: OPENAI_API_KEY })
+      .chat.completions.create({
+        model: "gpt-4o",
+        messages: ses.history,
+        functions,
+        function_call: "auto"
+      });
     ses.history.push(second.choices[0].message);
-    // 이제 computeCost 호출
     return completeCost(second.choices[0].message);
   }
 
-  // 3) computeCost 호출 필요 시
+  // 4) computeCost 호출 필요 시
   if (msg.function_call?.name === "computeCost") {
     return completeCost(msg);
   }
 
-  // 4) 일반 답변
+  // 5) 일반 챗 응답
   const reply = msg.content;
   return res.json({ reply });
-  
-  // — 내부 헬퍼: computeCost를 실행하고 최종 응답
+
+  // — 내부 헬퍼: computeCost 실행 후 최종 렌더링 & 응답
   async function completeCost(fnMsg) {
-    const args = JSON.parse(fnMsg.function_call.arguments);
+    const args    = JSON.parse(fnMsg.function_call.arguments);
     const costRes = await computeCost({
-      context: args.context,
+      context:   args.context,
       transport: args.transport,
-      km: args.km,
+      km:        args.km,
       days,
       patient
     });
     ses.history.push({
-      role: "function",
-      name: "computeCost",
+      role:    "function",
+      name:    "computeCost",
       content: JSON.stringify(costRes)
     });
-    // 최종 렌더링
-    const final = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: ses.history
-    });
+    const final = await new OpenAI({ apiKey: OPENAI_API_KEY })
+      .chat.completions.create({
+        model:    "gpt-4o",
+        messages: ses.history
+      });
     const finalReply = final.choices[0].message.content;
     ses.history.push({ role:"assistant", content: finalReply });
     return res.json({ reply: finalReply });
