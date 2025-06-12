@@ -2,10 +2,9 @@
 // · GPT-4o type / cremated 판정
 // · 외부 업체 언급 금지
 // · Google Distance Matrix API만 사용
-// · data/structured_단가표.json 의 “단가”와 “계산방식”만 참조
-// · 응답은 Markdown 형식으로 간결하게, 공감·애도 표현 포함
-// · 세션이 살아있는 동안 대화 이력 유지
-// · 마지막에 예측 견적 안내 문구 추가 (항공이송·고인이송)
+// · data/structured_단가표.json 에 있는 “단가”와 “계산방식”만 참조
+// · 응답은 마크다운 형식으로 간결하게, 공감·애도 표현 포함
+// · 세션이 살아있는 동안 대화 이력 유지 & Intent 기반 분기
 
 import express from "express";
 import cors from "cors";
@@ -23,12 +22,29 @@ const GMAPS_KEY = process.env.GMAPS_KEY;
 // ─── 단가표 로드 ─────────────────────────────────────────────────────────────
 const prices = JSON.parse(
   fs.readFileSync(path.join(__dirname, "data/structured_단가표.json"), "utf8")
-); // :contentReference[oaicite:0]{index=0}
+);
 
 // ─── OpenAI 클라이언트 ─────────────────────────────────────────────────────
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ─── Google Distance Matrix로 거리/시간 계산 ─────────────────────────────────────
+// ─── Intent 분류 함수 스키마 ─────────────────────────────────────────────────
+const intentFunctions = [{
+  name: "decideIntentAndParams",
+  description: "사용자 입력에서 intent와 파라미터를 추출합니다.",
+  parameters: {
+    type: "object",
+    properties: {
+      intent:      { type:"string", enum:["GENERAL","EXPLAIN_COST","CALCULATE_COST"] },
+      from:        { type:"string" },
+      to:          { type:"string" },
+      diagnosis:   { type:"string" },
+      days:        { type:"number" }
+    },
+    required: ["intent"]
+  }
+}];
+
+// ─── Google Distance Matrix 호출 ─────────────────────────────────────────────
 async function routeInfo(fromAddr, toAddr) {
   const url =
     `https://maps.googleapis.com/maps/api/distancematrix/json` +
@@ -42,158 +58,127 @@ async function routeInfo(fromAddr, toAddr) {
   }
   return {
     km:  Math.round(elem.distance.value / 1000),
-    hr: +(elem.duration.value / 3600).toFixed(1),
+    hr: +(elem.duration.value / 3600).toFixed(1)
   };
 }
 
-// ─── AI 플랜 생성 (JSON ONLY) ─────────────────────────────────────────────────
-async function gptPlan(diagnosis, km) {
-  // AI에게 필요한 staff•equipment 구성까지 “판단”시킴
-  const sys = `JSON ONLY:
-{"type":"air|funeral|event","cremated":bool,"risk":"low|medium|high","transport":"civil|airAmbulance|charter|ship","seat":"business|stretcher","staff":["doctor","nurse"],"equipment":{"ventilator":bool,"ecmo":bool},"medLvl":"low|medium|high","notes":["..."]}`;
-  const usr = `진단명:${diagnosis} / 거리:${km}`;
-  const { choices: [{ message }] } = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user",   content: usr }
-    ]
-  });
-  return JSON.parse(message.content.trim());
-}
-
-// ─── 비용 계산 ───────────────────────────────────────────────────────────────
+// ─── 비용 계산 (structured 단가표만 참조) ─────────────────────────────────
 function calcCost(ctx, plan, km, days) {
   let total = 0;
-  const breakdown = {};
-  const items = prices[ctx] || []; // 예: "행사지원" :contentReference[oaicite:1]{index=1}
-
+  const items = prices[ctx] || [];
   items.forEach(item => {
     const unit = item.단가;
-    let cost = 0;
     switch (item.계산방식) {
       case "단가x거리":
-        cost = unit * km;
-        break;
+        total += unit * km; break;
       case "단가x거리x인원":
-        cost = unit * km * (plan.staff.length || 1);
-        break;
+        total += unit * km * (plan.staff?.length||1); break;
       case "단가x일수":
-        cost = unit * days;
-        break;
+        total += unit * days; break;
       case "단가x일수x인원":
-        cost = unit * days * (plan.staff.length || 1);
-        break;
+        total += unit * days * (plan.staff?.length||1); break;
       case "단가":
-        cost = unit;
-        break;
+        total += unit; break;
     }
-    // 항목별로 합산
-    breakdown[item.품목] = (breakdown[item.품목] || 0) + cost;
-    total += cost;
   });
-
-  return { breakdown, total };
+  return total;
 }
 
-// ─── Express 설정 ───────────────────────────────────────────────────────────
+// ─── Express 설정 & 핸들러 ─────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 const sessions = {};
 
-app.post("/chat", async (req, res) => {
-  const { sessionId="def", message="", days=1, diagnosis="unknown" } = req.body;
+app.post('/chat', async (req, res) => {
+  const { sessionId='def', message='', patient={}, days=1 } = req.body;
 
-  // 세션 히스토리 유지
+  // 세션 초기화 및 히스토리 유지
   const ses = sessions[sessionId] ||= {
-    history: []
+    history: [
+      { role:'system', content:
+        `당신은 KMTC AI 상담원입니다. 외부 업체 언급 금지.
+        - 서비스: 항공이송, 고인이송, 행사 의료지원
+        - 행사 의료지원: 가격 설명만 제공
+        - 항공·고인 이송: 거리 계산 후 견적 제공
+        - 공감/애도 문구 포함
+        - 마지막에 예측 견적 안내 문구 삽입`
+      }
+    ]
   };
 
-  // (1) 고객 메시지 저장
-  ses.history.push({ role: "user", content: message });
+  // 1) Intent 분류 & 파라미터 추출
+  const classify = await openai.chat.completions.create({
+    model:'gpt-4o', temperature:0,
+    messages:[
+      ...ses.history,
+      { role:'user', content: message }
+    ],
+    functions: intentFunctions,
+    function_call:{ name:'decideIntentAndParams' }
+  });
+  const fn = classify.choices[0].message.function_call;
+  const args = JSON.parse(fn.arguments);
+  const intent = args.intent;
 
-  // (2) “견적 계산” 키워드 있으면 CALCULATE, 아니면 그냥 일반 챗
-  const isCalc = /견적/.test(message);
-
-  if (!isCalc) {
-    // 일반 상담
-    const chat = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.7,
-      messages: [
-        { role:"system", content:
-          "당신은 KMTC AI 상담원입니다. 외부 업체 언급 금지; 공감 표현 필수." },
-        ...ses.history
-      ]
-    });
-    const reply = chat.choices[0].message.content.trim();
-    ses.history.push({ role:"assistant", content: reply });
+  // 2) GENERAL 안내
+  if (intent === 'GENERAL') {
+    const reply = `안녕하세요! KMTC AI입니다. 항공이송, 고인이송, 행사 의료지원 중 원하시는 서비스를 말씀해주세요.`;
     return res.json({ reply });
   }
 
-  // (3) 거리/시간 계산 (항공이송/고인이송만)
-  let km=0, hr=0, ctx="행사지원";
-  if (/항공이송|고인이송/.test(message)) {
-    const m = message.match(/(.+)에서 (.+)까지/);
-    if (m) {
-      try {
-        ({ km, hr } = await routeInfo(m[1].trim(), m[2].trim()));
-      } catch{
-        // 실패 시 무시
-      }
-    }
-    // 고인/환자 여부에 따라 ctx 설정
-    ctx = /고인/.test(message) ? "고인이송" : "항공이송";
+  // 3) EXPLAIN_COST (행사 의료지원)
+  if (intent === 'EXPLAIN_COST') {
+    const reply = `**행사 의료지원 비용 안내**
+- 인력 비용: 현장 규모 및 요구사항에 따라 산출됩니다.
+- 장비 대여: 행사 특성에 따라 결정됩니다.
+
+*정확한 견적은 행사 기획사 또는 KMTC 유선 문의를 통해 제공됩니다.*`;
+    return res.json({ reply });
   }
 
-  // (4) AI에게 planner → staff·equipment 구성 지시
-  const plan = await gptPlan(diagnosis, km);
-
-  // (5) 비용 계산
-  //    행사: ctx="행사지원"; 항공/고인: ctx 설정
-  if (ctx === "행사지원") plan.staff = []; // 거리 무시
-  const { breakdown, total } = calcCost(ctx, plan, km, days);
-
-  // (6) Markdown으로 포맷팅
-  const lines = [];
-  // 서비스명 + 공감·애도
-  if (ctx === "고인이송") {
-    lines.push(`**삼가 고인의 명복을 빕니다.**`);
-  } else if (ctx === "항공이송") {
-    lines.push(`환자분의 상황이 많이 힘드셨을 텐데, 빠른 회복을 기원합니다.`);
-  }
-  lines.push(`## ${ctx} 견적`);
-  lines.push(`- **진단명**: ${diagnosis}`);
-  if (ctx !== "행사지원") {
-    lines.push(`- **거리/시간**: ${km}km / ${hr}h`);
-  }
-  lines.push(`\n### 필요 인력 & 장비`);
-  lines.push(`- **인력**: ${plan.staff.join(", ") || "없음"}`);
-  lines.push(`- **장비**: ${
-    Object.entries(plan.equipment)
-      .filter(([, v])=>v)
-      .map(([k])=>k).join(", ") || "없음"
-  }`);
-
-  lines.push(`\n### 예상 비용`);
-  for (const [item, cost] of Object.entries(breakdown)) {
-    lines.push(`- ${item}: ${cost.toLocaleString()}원`);
-  }
-  lines.push(`- **총합계**: ${total.toLocaleString()}원`);
-
-  // (7) 예측 견적 안내 (항공이송·고인이송만)
-  if (ctx !== "행사지원") {
-    lines.push(
-      `\n*이 견적은 예측 견적이며, 정확한 견적은 환자의 소견서 및 국제 유가, 항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*`
-    );
+  // 4) CALCULATE_COST (항공/고인 이송)
+  // 거리 계산
+  let km=0, hr=0;
+  try {
+    ({ km, hr } = await routeInfo(args.from, args.to));
+  } catch {
+    return res.json({ reply:'⚠️ 거리 계산 실패: 주소를 다시 확인해주세요.' });
   }
 
-  const reply = lines.join("\n");
-  ses.history.push({ role:"assistant", content: reply });
-  return res.json({ reply });
+  // AI 플랜 생성 (진단 기반 staff/equipment 결정)
+  const planSys = `JSON ONLY: {"type":"air|funeral","diagnosis":"..","transport":"civil|airAmbulance|charter","staff":["doctor","nurse"],"equipment":{"ventilator":bool}}`;
+  const planUsr = `진단:${args.diagnosis} / 거리:${km}`;
+  const planRes = await openai.chat.completions.create({
+    model:'gpt-4o', temperature:0.2,
+    messages:[ {role:'system',content:planSys},{role:'user',content:planUsr} ]
+  });
+  const plan = JSON.parse(planRes.choices[0].message.content);
+
+  // 비용 산출
+  const ctx = plan.type==='funeral'?'고인이송':'항공이송';
+  const cost = calcCost(ctx, plan, km, days);
+
+  // 감정 표현 + 견적
+  let reply = '';
+  if (ctx==='고인이송') {
+    reply += '삼가 고인의 명복을 빕니다.\n';
+  } else {
+    reply += '환자분의 상황이 많이 힘드셨을 텐데요. 빠른 쾌유를 기원합니다.\n';
+  }
+  reply += `**${ctx} 견적**
+- 진단명: ${args.diagnosis}
+- 출발→도착: ${args.from}→${args.to} (${km}km / ${hr}h)
+- 필요 인력: ${plan.staff.join(', ')}
+- 필요 장비: ${Object.entries(plan.equipment).filter(([k,v])=>v).map(([k])=>k).join(', ')||'없음'}
+
+💰 **총 예상 비용: 약 ${cost.toLocaleString()}원**
+
+*이 견적은 예측 견적이며, 정확한 견적은 환자의 소견서 및 국제 유가, 항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*`;
+
+  // 5) 히스토리 저장 & 응답
+  ses.history.push({ role:'assistant', content:reply });
+  res.json({ reply });
 });
 
-app.listen(3000, () => console.log("🚀 KMTC AI running on port 3000"));
+app.listen(3000,()=>console.log('🚀 KMTC AI running on port 3000'));
