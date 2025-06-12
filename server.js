@@ -1,4 +1,4 @@
-// backend/server.js – KMTC AI 2025-06-12 (v15.0)
+// backend/server.js – KMTC AI 2025-06-12 (v15.1)
 // · GPT-4o type / cremated 판정
 // · 외부 업체 언급 금지
 // · Google Distance Matrix API만 사용
@@ -17,9 +17,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 config();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const GMAPS_KEY       = process.env.GMAPS_KEY;
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+const __dirname      = path.dirname(fileURLToPath(import.meta.url));
+const GMAPS_KEY      = process.env.GMAPS_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // ─── 단가표 로드 ─────────────────────────────────────────────────────────────
 const prices = JSON.parse(
@@ -29,7 +29,7 @@ const prices = JSON.parse(
 // ─── OpenAI 클라이언트 ─────────────────────────────────────────────────────
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ─── Google Distance Matrix로 거리/시간 계산 ─────────────────────────────────────
+// ─── Google Distance Matrix로 거리/시간 계산 ─────────────────────────────────
 async function routeInfo(fromAddr, toAddr) {
   const url =
     `https://maps.googleapis.com/maps/api/distancematrix/json` +
@@ -63,11 +63,9 @@ async function gptPlan(patient, km) {
     ]
   });
   
-  // 안전하게 JSON 파싱
   try {
     return JSON.parse(message.content.trim());
   } catch {
-    // 파싱 실패 시 기본 플랜 반환
     return {
       type:      "air",
       cremated:  false,
@@ -103,7 +101,7 @@ function calcCost(ctx, plan, km, days) {
   return total;
 }
 
-// ─── system prompt ────────────────────────────────────────────────────────────
+// ─── system prompt ───────────────────────────────────────────────────────────
 const systemPrompt = `
 당신은 KMTC AI 상담원입니다.
 - 제공 서비스: 항공이송, 고인이송, 행사 의료지원
@@ -125,29 +123,23 @@ app.use(express.json());
 const sessions = {};
 
 app.post("/chat", async (req, res) => {
-  const {
-    sessionId = "def",
-    message   = "",
-    days      = 1,
-    patient   = {}
-  } = req.body;
+  const { sessionId = "def", message = "", days = 1, patient = {} } = req.body;
 
   // 세션 초기화 및 히스토리 유지
   const ses = sessions[sessionId] ||= {
     history: [{ role: "system", content: systemPrompt }]
   };
 
-  // 1) 항공이송/고인이송일 때: 출발·도착지 확보
+  // 1) 항공이송/고인이송일 때: 출발·도착지 확보 & 거리 계산
   let km = 0, hr = 0;
   if (/항공이송|고인이송/.test(message)) {
     const m = message.match(/(.+)에서\s*(.+)까지/);
     if (!m) {
-      // 주소 없으면 요청
       const ask = "📝 출발지와 도착지를 알려주세요. 예: `호치민에서 인천까지`";
       ses.history.push({ role: "assistant", content: ask });
       return res.json({ reply: ask });
     }
-    const from = m[1].trim(), to = m[2].trim();
+    const [ , from, to ] = m.map(s => s.trim());
     try {
       ({ km, hr } = await routeInfo(from, to));
       ses.history.push({
@@ -169,36 +161,26 @@ app.post("/chat", async (req, res) => {
   const ctx   = plan0.type === "funeral" ? "고인이송"
               : plan0.type === "event"   ? "행사지원"
               :                             "항공이송";
-  const transports = [ plan0.transport ];
 
   // 4) 비용 계산
-  const results = transports.map(t => {
-    const plan = { ...plan0, transport: t };
-    if (ctx === "고인이송") plan.seat = "coffin";
-    return {
-      transport: t,
-      total:     calcCost(ctx, plan, km, days)
-    };
-  });
+  const total = calcCost(ctx, plan0, km, days);
 
   // 5) 답변 조합
   let reply = "";
 
-  // 감정 표현 및 헤더
   if (ctx === "고인이송") {
     reply += "**삼가 고인의 명복을 빕니다.**\n\n";
   } else if (ctx === "항공이송") {
     reply += "환자분의 상황이 많이 힘드셨을 텐데… 빠른 쾌유를 기원합니다.\n\n";
   }
 
-  // 본문
   if (ctx === "행사지원") {
     reply += `### 행사지원 견적\n\n`;
     reply += `- 필요 인력 & 장비:  
   - 인력: ${plan0.staff.join(", ")}  
   - 장비: 없음\n\n`;
     reply += `### 예상 비용\n\n`;
-    reply += `- 총합계: ${results[0].total.toLocaleString("ko-KR")}원\n\n`;
+    reply += `- 총합계: ${total.toLocaleString("ko-KR")}원\n\n`;
   } else {
     reply += `### ${ctx === "항공이송" ? "항공이송" : "고인이송"} 견적\n\n`;
     reply += `- 거리/시간: ${km}km / ${hr}h\n`;
@@ -209,11 +191,7 @@ app.post("/chat", async (req, res) => {
         .map(([k]) => k.charAt(0).toUpperCase() + k.slice(1))
         .join(", ") || "없음"}\n\n`;
     reply += `### 예상 비용\n\n`;
-    results.forEach(r => {
-      reply += `- ${r.transport}: ${r.total.toLocaleString("ko-KR")}원\n`;
-    });
-    reply += "\n";
-    // 예측 견적 안내
+    reply += `- 총합계: ${total.toLocaleString("ko-KR")}원\n\n`;
     reply += `*이 견적은 예측 견적이며, 정확한 견적은 환자의 소견서 및 국제 유가, 항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*\n`;
   }
 
