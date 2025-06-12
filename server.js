@@ -1,9 +1,8 @@
-// backend/server.js – KMTC AI 2025-06-12 (vLogicCorrected)
+// backend/server.js – KMTC AI 2025-06-12 (vFinal)
 // · Render.com 배포용 PORT 바인딩(process.env.PORT || 3000)
-// · [수정] Function Calling을 통해 이송 계획 수립 → 계획 기반 비용 계산 로직
+// · [수정] All-Inclusive(전용기/에어앰블런스)와 A la carte(민항기 등) 비용 계산 로직 분리
 // · Google Geocoding + Distance Matrix API 사용, 실패 시 Haversine 법으로 대체
-// · [수정] data/structured_단가표.json의 항목을 '계획'에 따라 선별적으로 계산
-// · 이송 종류: 민항기, 에어앰블런스, 전용기, 선박 등
+// · data/structured_단가표.json의 항목을 '계획'에 따라 선별적으로 계산
 // · 응답은 마크다운 형식으로, 공감·애도 표현 포함
 // · 세션 동안 대화 이력 유지, 모든 단계 에러 로깅
 
@@ -75,113 +74,141 @@ async function getDistance({ origin, destination }) {
 
 // [핵심 수정] 계획 수립 및 비용 계산
 async function generatePlanAndCalculateCost({ origin, destination, patient, transportType, days = 1 }) {
-  try {
-    const distanceResult = await getDistance({ origin, destination });
-    if (distanceResult.error) return distanceResult;
-    const { km } = distanceResult;
-
-    // 1. AI를 통해 환자 상태, 거리를 기반으로 상세 계획 수립
-    const planPrompt = `
-      환자 정보와 이송 정보를 바탕으로 가장 적합한 이송 계획을 JSON 형식으로 세워주세요.
-      - 환자 정보: ${JSON.stringify(patient)}
-      - 희망 이송수단: ${transportType}
-      - 총 거리: ${km} km
-      - 예상 소요 일수: ${days}일
-
-      JSON 형식:
-      {
-        "context": "항공이송" | "고인이송" | "행사지원",
-        "transport": "민항기" | "전용기" | "에어앰블런스" | "선박" | "헬기",
-        "transportDetail": "스트헤쳐" | "비즈니스" | "전용기" | "에어앰블런스" | "비즈니스실" | "헬리콥터",
-        "team": ["의사", "간호사", "응급구조사", "핸들러"],
-        "equipment": ["환자감시모니터", "자동제세동기", "썩션기"],
-        "cremated": boolean (고인이송 시)
-      }
-    `;
-
-    const planResponse = await openai.chat.completions.create({
-      model: "gpt-4o",
-      response_format: { type: "json_object" },
-      messages: [{ role: "system", content: "You are a helpful assistant that creates transport plans in JSON format." }, { role: "user", content: planPrompt }]
-    });
-
-    const plan = JSON.parse(planResponse.choices[0].message.content);
-
-    // 2. 생성된 plan을 기반으로 비용 계산
-    let totalCost = 0;
-    const breakdown = [];
-    const priceCategory = prices[plan.context] || [];
-
-    const findAndAdd = (품목, 계산방식, 수량 = 1) => {
-        const item = priceCategory.find(p => p.품목 === 품목);
-        if (item) {
-            let cost = 0;
-            switch(계산방식) {
-                case "단가": cost = item.단가; break;
-                case "단가x거리": cost = item.단가 * km; break;
-                case "단가x일수": cost = item.단가 * days; break;
-                case "단가x거리x인원": cost = item.단가 * km * 수량; break;
-                case "단가x일수x인원": cost = item.단가 * days * 수량; break;
-            }
-            if (cost > 0) {
-                totalCost += cost;
-                breakdown.push({ 항목: 품목, 비용: cost });
-            }
+    try {
+      const distanceResult = await getDistance({ origin, destination });
+      if (distanceResult.error) return distanceResult;
+      const { km } = distanceResult;
+  
+      // 1. AI를 통해 환자 상태, 거리를 기반으로 상세 계획 수립
+      const planPrompt = `
+        환자 정보와 이송 정보를 바탕으로 가장 적합한 이송 계획을 JSON 형식으로 세워주세요.
+        - 환자 정보: ${JSON.stringify(patient)}
+        - 희망 이송수단: ${transportType}
+        - 총 거리: ${km} km
+        - 예상 소요 일수: ${days}일
+  
+        JSON 형식:
+        {
+          "context": "항공이송" | "고인이송",
+          "transport": "민항기" | "전용기" | "에어앰블런스" | "선박" | "헬기",
+          "transportDetail": "스트헤쳐" | "비즈니스" | "전용기" | "에어앰블런스" | "비즈니스실" | "헬리콥터",
+          "team": ["의사", "간호사", "응급구조사"],
+          "equipment": ["환자감시모니터", "자동제세동기", "썩션기"],
+          "notes": "환자 상태에 따른 특이사항"
         }
-    };
-    
-    // 항공/선박료 계산
-    const transportItem = priceCategory.find(p => p.세부구분 === plan.transport && p.종류 === plan.transportDetail);
-    if(transportItem) {
-        findAndAdd(transportItem.품목, transportItem.계산방식);
+      `;
+  
+      const planResponse = await openai.chat.completions.create({
+        model: "gpt-4o",
+        response_format: { type: "json_object" },
+        messages: [{ role: "system", content: "You are a helpful assistant that creates transport plans in JSON format based on patient data." }, { role: "user", content: planPrompt }]
+      });
+  
+      const plan = JSON.parse(planResponse.choices[0].message.content);
+      console.log("🤖 Generated Plan:", plan);
+  
+      // 2. 생성된 plan을 기반으로 비용 계산
+      let totalCost = 0;
+      const breakdown = [];
+      const priceCategory = prices[plan.context] || [];
+      const allInclusiveTransports = ["전용기", "에어앰블런스", "헬기"];
+  
+      // 개선된 비용 추가 헬퍼 함수
+      const findAndAdd = (filters, qty = 1, note = "") => {
+          const item = priceCategory.find(p => 
+              Object.entries(filters).every(([key, value]) => p[key] === value)
+          );
+          if (item) {
+              let cost = 0;
+              switch(item.계산방식) {
+                  case "단가": cost = item.단가 * qty; break;
+                  case "단가x거리": cost = item.단가 * km; break;
+                  case "단가x일수": cost = item.단가 * days * qty; break;
+                  case "단가x거리x인원": cost = item.단가 * km * qty; break;
+                  case "단가x일수x인원": cost = item.단가 * days * qty; break;
+              }
+              if (cost > 0) {
+                  totalCost += cost;
+                  breakdown.push({ 항목: `${item.품목}${note}`, 비용: cost, 단가: item.단가 });
+              }
+          }
+      };
+      
+      // --- 비용 계산 로직 시작 ---
+  
+      // 2-1. 주 운송수단 비용 계산
+      const transportItem = priceCategory.find(p => p.세부구분 === plan.transport);
+      if (transportItem) {
+          findAndAdd({ 등록번호: transportItem.등록번호 });
+      }
+  
+      // 2-2. 운송수단에 따른 부대비용 추가
+      if (allInclusiveTransports.includes(plan.transport)) {
+          // 전용기, 에어앰블런스, 헬기는 운송료에 대부분 포함됨
+          // 비고: "환자이송에 필요한 전체금액 전체포함 의료기기 의약품 인건비 화물료포함"
+          console.log(`[INFO] All-inclusive transport: ${plan.transport}. 부대비용 추가하지 않음.`);
+          
+          // 포함되지 않는 별도 항목(예: 양 끝단 지상 구급차)만 추가 가능
+          // findAndAdd({ 종류: "현지구급차", 품목: "지상구급차" });
+          // findAndAdd({ 종류: "국내구급차", 품목: "지상구급차" });
+  
+      } else {
+          // 민항기, 선박 등은 부대 비용을 개별적으로 추가
+          console.log(`[INFO] A la carte transport: ${plan.transport}. 부대비용 추가.`);
+          
+          // 의료팀 인건비
+          plan.team.forEach(member => findAndAdd({ 품목: member, 세부구분: '인건비' }, 1, ` ${days}일`));
+  
+          // 장비 비용
+          plan.equipment.forEach(equip => findAndAdd({ 품목: equip, 세부구분: '의료장비' }, 1, ` ${days}일`));
+  
+          // 필수 경비
+          findAndAdd({ 종류: "현지업무처리", 품목: "핸들링비용" });
+          findAndAdd({ 종류: "국내업무처리", 품목: "핸들링비용" });
+          findAndAdd({ 종류: "의료장비화물료" });
+          findAndAdd({ 품목: "의료용 의약품세트" });
+          findAndAdd({ 종류: "현지구급차" });
+          findAndAdd({ 종류: "국내구급차" });
+      }
+  
+      // 3. 최종 결과 생성
+      const transportLabels = {
+          민항기: "민항기 (상업용 여객기)",
+          전용기: "전용기 (Air Charter)",
+          에어앰블런스: "에어앰블런스 (Air Ambulance)",
+          선박: "선박",
+          헬기: "헬리콥터"
+      };
+  
+      let reply = "";
+      if (plan.context === "고인이송") {
+        reply += "**삼가 고인의 명복을 빕니다.**\n\n";
+      } else {
+        reply += "환자분의 빠른 쾌유를 진심으로 기원합니다.\n요청하신 내용을 바탕으로 예상 견적을 안내해 드립니다.\n\n";
+      }
+  
+      reply += `### 📋 이송 계획 요약\n`;
+      reply += `- **이송 종류**: ${plan.context}\n`;
+      reply += `- **운송 수단**: ${transportLabels[plan.transport] || plan.transport}\n`;
+      reply += `- **총 거리**: 약 ${km.toLocaleString()} km\n`;
+      reply += `- **예상 소요 기간**: ${days}일\n`;
+      if (plan.team && plan.team.length > 0) {
+          reply += `- **의료팀 구성**: ${plan.team.join(", ")}\n`;
+      }
+      reply += `\n### 💰 예상 비용\n`;
+      reply += `**총 예상 비용: ${Math.round(totalCost).toLocaleString()}원**\n\n`;
+      reply += `*이 견적은 AI가 수립한 계획에 따른 예측 금액이며, 실제 비용은 환자 상태, 항공/선박 운임 변동, 현지 상황 등 여러 요인에 따라 달라질 수 있습니다. 정확한 비용은 전문 상담사와 상담 후 확정됩니다.*\n`;
+      
+      console.log("📊 Breakdown:", breakdown);
+      console.log("💵 Total Cost:", totalCost);
+  
+      return { reply };
+  
+    } catch (err) {
+      console.error("🛑 generatePlanAndCalculateCost error:", err);
+      return { error: "계획 수립 또는 비용 계산 중 오류가 발생했습니다." };
     }
-
-    // 의료팀 인건비 계산
-    plan.team.forEach(member => findAndAdd(member, "단가x일수"));
-
-    // 장비 비용 계산
-    plan.equipment.forEach(equip => findAndAdd(equip, "단가x일수"));
-
-    // 기타 필수 비용 추가 (핸들링, 구급차 등)
-    findAndAdd("핸들링비용", "단가"); // 현지+국내 핸들링 비용은 예시로 하나만 추가, 실제로는 더 세분화 필요
-    findAndAdd("지상구급차", "단가"); // 현지 구급차
-    findAndAdd("지상구급차", "단가x거리"); // 국내 구급차
-
-
-    // 3. 최종 결과 생성
-    const transportLabels = {
-        민항기: "민항기 (상업용 여객기)",
-        국적기: "국적기 (대한항공·아시아나 등)", // 필요시 추가
-        에어앰블런스: "에어앰블런스",
-        전용기: "전용기 (임차 전용기)",
-        선박: "선박"
-    };
-
-    let reply = "";
-    if (plan.context === "고인이송") {
-      reply += "**삼가 고인의 명복을 빕니다.**\n\n";
-    } else {
-      reply += "환자분의 빠른 쾌유를 진심으로 기원합니다.\n요청하신 내용을 바탕으로 예상 견적을 안내해 드립니다.\n\n";
-    }
-
-    reply += `### 📋 이송 계획 요약\n`;
-    reply += `- **이송 종류**: ${plan.context}\n`;
-    reply += `- **운송 수단**: ${transportLabels[plan.transport] || plan.transport}\n`;
-    reply += `- **총 거리**: 약 ${km.toLocaleString()} km\n`;
-    reply += `- **예상 소요 기간**: ${days}일\n`;
-    reply += `- **의료팀 구성**: ${plan.team.join(", ")}\n\n`;
-    reply += `### 💰 예상 비용\n`;
-    reply += `**총 예상 비용: ${Math.round(totalCost).toLocaleString()}원**\n\n`;
-    reply += `*이 견적은 AI가 수립한 계획에 따른 예측 금액이며, 실제 비용은 환자 상태, 항공/선박 운임 변동, 현지 상황 등 여러 요인에 따라 달라질 수 있습니다. 정확한 비용은 전문 상담사와 상담 후 확정됩니다.*\n`;
-
-    return { plan, calculation: { totalCost, breakdown, km }, reply };
-
-  } catch (err) {
-    console.error("🛑 generatePlanAndCalculateCost error:", err);
-    return { error: "계획 수립 또는 비용 계산 중 오류가 발생했습니다." };
   }
-}
-
 
 // ─── Function Calling 정의 ─────────────────────────────────────────────────
 const functions = [
@@ -340,4 +367,4 @@ app.post("/chat", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 KMTC AI (Corrected) running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 KMTC AI (Final) running on port ${PORT}`));
