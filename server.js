@@ -35,9 +35,12 @@ async function routeInfo(fromAddr, toAddr) {
     `?origins=${encodeURIComponent(fromAddr)}` +
     `&destinations=${encodeURIComponent(toAddr)}` +
     `&key=${GMAPS_KEY}&language=ko`;
+  console.log("[DEBUG] DistanceMatrix 요청 URL:", url);
   const js = await fetch(url).then(r => r.json());
+  console.log("[DEBUG] DistanceMatrix 응답:", js);
   const elem = js.rows?.[0]?.elements?.[0];
   if (!elem || elem.status !== "OK" || !elem.distance) {
+    console.error("[ERROR] 거리 계산 실패:", elem?.status, js.error_message);
     throw new Error(`거리 계산 실패: status=${elem?.status}`);
   }
   return {
