@@ -1,4 +1,5 @@
-// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Fallback+TransportCategories)
+// backend/server.js – KMTC AI 2025-06-12 (vFuncCall+Geocode+Fallback+TransportCategories+FenceStrip)
+// · Render.com 배포용 PORT 바인딩(process.env.PORT || 3000)
 // · Function Calling으로 주소 해석→거리 계산→비용 산출까지 자동 처리
 // · Google Geocoding + Distance Matrix API 사용, 실패 시 Haversine 법으로 대체
 // · data/structured_단가표.json에 있는 “단가”와 “계산방식”만 참조
@@ -106,9 +107,15 @@ async function computeCost({ context, transport, km, days, patient }) {
         }
       ]
     });
+    // 🎯 마크다운 펜스 제거
+    let raw = planRes.choices[0].message.content.trim();
+    raw = raw
+      .replace(/^```(?:json)?\r?\n/, "")
+      .replace(/```$/, "")
+      .trim();
     let plan0;
     try {
-      plan0 = JSON.parse(planRes.choices[0].message.content.trim());
+      plan0 = JSON.parse(raw);
     } catch (parseErr) {
       console.error("🛑 plan JSON parse error:", parseErr);
       plan0 = {
@@ -196,7 +203,6 @@ const transportLabels = {
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 const sessions = {};
 
 app.post("/chat", async (req, res) => {
@@ -218,10 +224,10 @@ app.post("/chat", async (req, res) => {
       }]
     };
 
-    // 1) 사용자 메시지 히스토리에 추가
+    // 1) 사용자 메시지 추가
     ses.history.push({ role: "user", content: message });
 
-    // 2) Function Calling 첫 요청
+    // 2) Function Calling 첫 호출
     const first = await new OpenAI({ apiKey: OPENAI_API_KEY })
       .chat.completions.create({
         model: "gpt-4o",
@@ -232,47 +238,38 @@ app.post("/chat", async (req, res) => {
     const msg = first.choices[0].message;
     ses.history.push(msg);
 
-    // 3) 주소 → 위경도
+    // 3) geocodeAddress
     if (msg.function_call?.name === "geocodeAddress") {
       const { address } = JSON.parse(msg.function_call.arguments);
       const loc = await geocodeAddress({ address });
-      ses.history.push({
-        role: "function",
-        name: "geocodeAddress",
-        content: JSON.stringify(loc)
-      });
+      ses.history.push({ role: "function", name: "geocodeAddress", content: JSON.stringify(loc) });
       return invokeNext();
     }
 
-    // 4) 위경도 → 거리/시간
+    // 4) getDistance
     if (msg.function_call?.name === "getDistance") {
       const { origin, destination } = JSON.parse(msg.function_call.arguments);
       const dist = await getDistance({ origin, destination });
-      ses.history.push({
-        role: "function",
-        name: "getDistance",
-        content: JSON.stringify(dist)
-      });
+      ses.history.push({ role: "function", name: "getDistance", content: JSON.stringify(dist) });
       return invokeNext();
     }
 
-    // 5) 비용 산출
+    // 5) computeCost
     if (msg.function_call?.name === "computeCost") {
       return completeCost(msg);
     }
 
-    // 6) 일반 대화 응답
+    // 6) 일반 응답
     return res.json({ reply: msg.content });
 
-    // ── 헬퍼: geocode/getDistance 후 다시 AI에게 넘기기
+    // ── 헬퍼: geocode/getDistance → AI에 재호출
     async function invokeNext() {
-      const next = await new OpenAI({ apiKey: OPENAI_API_KEY })
-        .chat.completions.create({
-          model: "gpt-4o",
-          messages: ses.history,
-          functions,
-          function_call: "auto"
-        });
+      const next = await new OpenAI({ apiKey: OPENAI_API_KEY }).chat.completions.create({
+        model: "gpt-4o",
+        messages: ses.history,
+        functions,
+        function_call: "auto"
+      });
       const m2 = next.choices[0].message;
       ses.history.push(m2);
       if (m2.function_call?.name === "computeCost") {
@@ -281,30 +278,24 @@ app.post("/chat", async (req, res) => {
       return res.json({ reply: m2.content });
     }
 
-    // ── 헬퍼: computeCost 실행 후 최종 마크다운 직접 렌더링
+    // ── 헬퍼: computeCost → 직접 마크다운 조립 & 응답
     async function completeCost(fnMsg) {
-      const args    = JSON.parse(fnMsg.function_call.arguments);
+      const args = JSON.parse(fnMsg.function_call.arguments);
       const costRes = await computeCost({
-        context:   args.context,
+        context: args.context,
         transport: args.transport,
-        km:        args.km,
+        km: args.km,
         days,
         patient
       });
-      ses.history.push({
-        role: "function",
-        name: "computeCost",
-        content: JSON.stringify(costRes)
-      });
+      ses.history.push({ role: "function", name: "computeCost", content: JSON.stringify(costRes) });
 
-      // 직접 마크다운 조립
-      const { plan, context, km, days: d, total, transport } = costRes;
+      // 직접 렌더링
+      const { context, transport, km, total } = costRes;
       let reply = "";
-
-      // 공감·애도
       if (context === "고인이송") {
         reply += "**삼가 고인의 명복을 빕니다.**\n\n";
-      } else if (context === "항공이송") {
+      } else {
         reply += "환자분의 상황이 많이 힘드셨을 텐데… 빠른 쾌유를 기원합니다.\n\n";
       }
 
@@ -315,21 +306,17 @@ app.post("/chat", async (req, res) => {
       });
       reply += "\n";
 
-      // 상세 견적
       reply += `### ${context} 견적 정보\n\n`;
-      reply += `- 거리/시간: ${km.toLocaleString()} km / ${costRes.hr} h\n`;
-      reply += `- 진단명: ${patient.diagnosis || "알 수 없음"}\n`;
-      reply += `- 필요 인력: ${plan.staff.join(", ")}\n`;
-      reply += `- 장비: ${Object.entries(plan.equipment).filter(([,v])=>v).map(([k])=>k).join(", ")||"없음"}\n\n`;
+      reply += `- 거리/시간: ${km.toLocaleString()} km\n\n`;
       reply += `### 예상 비용\n\n`;
       reply += `- ${transportLabels[transport]}: **${total.toLocaleString()}원**\n\n`;
-      reply += `*이 견적은 예측 견적이며, 환자 상태·국제 유가·항공료 등에 따라 달라집니다. 자세한 견적은 KMTC 유선전화로 문의하세요.*\n`;
+      reply += `*이 견적은 예측 견적이며, 실제 비용은 환자 상태·항공료·기타 변수에 따라 달라집니다.*\n`;
 
       ses.history.push({ role: "assistant", content: reply });
       return res.json({ reply });
     }
-
-  } catch (err) {
+  }
+  catch (err) {
     console.error("🛑 /chat error:", err);
     return res.json({
       reply: "⚠️ 서버 내부에서 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
@@ -337,4 +324,6 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("🚀 KMTC AI running on port 3000"));
+// Render.com: process.env.PORT 바인딩
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 KMTC AI running on port ${PORT}`));
